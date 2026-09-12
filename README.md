@@ -11,7 +11,7 @@ An incredibly fast implementation of Whisper optimized for Apple Silicon.
 - **Batched Decoding** -> Higher Throughput
 - **Distilled Models** -> Faster Decoding (less layers)
 - **Quantized Models** -> Faster Memory Movement
-- _Coming Soon: Speculative Decoding -> Faster Decoding with Assistant Model_
+- **Lossless speculative decoding** -> Optional assistant-model or MTP acceleration
 
 ## Installation
 
@@ -34,6 +34,38 @@ Quantization
 ```
 [None, "4bit", "8bit"]
 ```
+
+Speculative decoding is opt-in and supports temperature-zero greedy decoding.
+`none` remains the default. Assistant mode currently requires `batch_size=1` and
+an assistant model with a compatible tokenizer vocabulary; MTP mode requires a
+versioned checkpoint produced by the training tools.
+
+```python
+whisper = LightningWhisperMLX(
+	model="base",
+	speculative_mode="assistant",
+	assistant_model="mlx-community/whisper-tiny-mlx",
+	lookahead=2,
+	batch_size=1,
+)
+```
+
+Both modes verify every proposed token with the target model. Rejected proposals
+are corrected by the target, and existing timestamp/suppression filters remain
+canonical. No accelerator is enabled automatically without benchmark evidence.
+
+## Development
+
+Use a project-local Python 3.12 environment on Apple Silicon. Run the test suite
+outside sandboxed execution because MLX requires Metal access:
+
+```bash
+python -m pytest -q
+```
+
+Training manifests reference source cache files and never copy source audio.
+Pseudo-label output and MTP checkpoints are generated artifacts and should remain
+outside Git unless a small provenance record is explicitly requested.
 
 #### Example
 
