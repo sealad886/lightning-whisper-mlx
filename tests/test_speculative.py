@@ -24,6 +24,7 @@ def test_full_acceptance_commits_bonus_token():
     assert result.accepted == 2
     assert result.rejected == 0
     assert result.bonus_tokens == 1
+    assert len(result.token_logprobs) == len(result.tokens)
 
 
 def test_rejection_commits_target_correction_and_stops_block():
@@ -42,6 +43,23 @@ def test_rejection_commits_target_correction_and_stops_block():
     assert result.accepted == 1
     assert result.rejected == 1
     assert result.bonus_tokens == 0
+
+
+def test_verifier_logprobs_can_be_trimmed_to_returned_context():
+    result = verify_greedy_proposals(
+        prefix=[10],
+        proposals=[1, 2],
+        target_logits=[
+            mx.array([0.0, 5.0, 0.0]),
+            mx.array([0.0, 0.0, 5.0]),
+            mx.array([5.0, 0.0, 0.0]),
+        ],
+        eot=2,
+    )
+
+    assert len(result.tokens) == 2
+    assert len(result.token_logprobs) == 2
+    assert result.sum_logprob == pytest.approx(sum(result.token_logprobs))
 
 
 def test_acceleration_requires_greedy_decoding():

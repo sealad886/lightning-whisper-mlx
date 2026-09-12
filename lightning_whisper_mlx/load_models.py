@@ -1,6 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 import json
+import hashlib
 from pathlib import Path
 
 import mlx.core as mx
@@ -40,4 +41,10 @@ def load_model(
 
     model.update(weights)
     mx.eval(model.parameters())
+    digest = hashlib.sha256()
+    for filename in ("config.json", "weights.npz"):
+        with (model_path / filename).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    model._checkpoint_fingerprint = digest.hexdigest()
     return model

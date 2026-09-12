@@ -51,3 +51,12 @@ def test_mtp_checkpoint_metadata_rejects_incompatible_base():
             decoder_hidden_size=8,
             vocabulary_size=32,
         )
+
+    with pytest.raises(ValueError, match="tokenizer fingerprint"):
+        validate_checkpoint_metadata(
+            metadata,
+            base_model_fingerprint="fingerprint-a",
+            tokenizer_fingerprint="tokenizer-b",
+            decoder_hidden_size=8,
+            vocabulary_size=32,
+        )

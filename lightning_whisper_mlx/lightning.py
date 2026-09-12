@@ -71,6 +71,15 @@ class LightningWhisperMLX():
         if model not in models: 
             raise ValueError("Please select a valid model")
 
+        if (
+            isinstance(assistant_model, str)
+            and assistant_quant is not None
+            and assistant_model in models
+        ):
+            if assistant_quant not in models[assistant_model]:
+                raise ValueError("assistant_quant is unavailable for assistant_model")
+            assistant_model = models[assistant_model][assistant_quant]
+
         self.speculative_options = SpeculativeOptions(
             speculative_mode=speculative_mode,
             lookahead=lookahead,

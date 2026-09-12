@@ -22,6 +22,7 @@ class VerificationResult:
     accepted: int
     rejected: int
     bonus_tokens: int
+    token_logprobs: List[float]
     sum_logprob: float
 
 
@@ -35,6 +36,7 @@ class AssistantProposer:
         self.audio_features = audio_features
         self.lookahead = lookahead
         self._next_logits = self.inference.prefill(prefix, audio_features)
+        self._prefix_cache_length = self.inference.cache_length
 
     @property
     def cache_length(self) -> int:
@@ -53,8 +55,7 @@ class AssistantProposer:
         return proposals
 
     def synchronize(self, accepted: int, committed_tokens: Sequence[int]):
-        committed_prefix_length = self.cache_length - (len(committed_tokens) - accepted)
-        self.inference.truncate(committed_prefix_length)
+        self.inference.truncate(self._prefix_cache_length + accepted)
         for token in committed_tokens[accepted:]:
             self._next_logits = self.inference.forward_one(
                 mx.array([[token]]), self.audio_features
@@ -158,8 +159,9 @@ class AssistantSpeculativeDecoder:
             proposals = self.proposer.propose()
             result = self.verifier.verify(proposals)
             self.proposer.synchronize(result.accepted, result.tokens)
-            generated.extend(result.tokens)
-            sum_logprob += result.sum_logprob
+            remaining = sample_len - len(generated)
+            generated.extend(result.tokens[:remaining])
+            sum_logprob += sum(result.token_logprobs[:remaining])
             if self.eot in result.tokens:
                 break
         return generated[:sample_len], float(sum_logprob)
@@ -231,8 +233,9 @@ class MTPSpeculativeDecoder:
         while len(generated) < sample_len:
             self.proposer.next_logits = self.verifier.next_logits
             result = self.verifier.verify(self.proposer.propose())
-            generated.extend(result.tokens)
-            sum_logprob += result.sum_logprob
+            remaining = sample_len - len(generated)
+            generated.extend(result.tokens[:remaining])
+            sum_logprob += sum(result.token_logprobs[:remaining])
             if self.eot in result.tokens:
                 break
         return generated[:sample_len], float(sum_logprob)
@@ -282,6 +285,7 @@ def verify_greedy_proposals(
     accepted = 0
     rejected = 0
     sum_logprob = 0.0
+    token_logprobs: List[float] = []
     filters = tuple(logit_filters or ())
 
     for index, proposal in enumerate(proposals):
@@ -300,14 +304,20 @@ def verify_greedy_proposals(
             rejected += 1
         generated.append(selected)
         history.append(selected)
-        sum_logprob += float(logprobs[0, selected].item())
+        token_logprob = float(logprobs[0, selected].item())
+        token_logprobs.append(token_logprob)
+        sum_logprob += token_logprob
         if selected == eot:
             break
         if proposal != target:
             break
 
     bonus_tokens = 0
-    if accepted == len(proposals) and len(logits) > len(proposals):
+    if (
+        accepted == len(proposals)
+        and len(logits) > len(proposals)
+        and (not generated or generated[-1] != eot)
+    ):
         row = _as_row(logits[len(proposals)]).astype(mx.float32)
         filtered = row
         token_history = mx.array([history])
@@ -317,12 +327,15 @@ def verify_greedy_proposals(
         generated.append(bonus)
         bonus_tokens = 1
         logprobs = filtered - mx.logsumexp(filtered, axis=-1, keepdims=True)
-        sum_logprob += float(logprobs[0, bonus].item())
+        token_logprob = float(logprobs[0, bonus].item())
+        token_logprobs.append(token_logprob)
+        sum_logprob += token_logprob
 
     return VerificationResult(
         tokens=generated,
         accepted=accepted,
         rejected=rejected,
         bonus_tokens=bonus_tokens,
+        token_logprobs=token_logprobs,
         sum_logprob=sum_logprob,
     )

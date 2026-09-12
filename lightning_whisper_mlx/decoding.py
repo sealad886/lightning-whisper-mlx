@@ -669,11 +669,20 @@ class DecodingTask:
                 eot=self.tokenizer.eot,
                 logit_filters=self.logit_filters,
             )
+            no_speech = [np.nan]
+            if self.tokenizer.no_speech is not None:
+                no_speech = [
+                    float(
+                        mx.softmax(
+                            speculative.verifier.next_logits[:, self.sot_index], axis=-1
+                        )[0, self.tokenizer.no_speech].item()
+                    )
+                ]
             generated, sum_logprob = speculative.decode(self.sample_len)
             return (
                 mx.array([prefix + generated]),
                 mx.array([sum_logprob]),
-                [np.nan],
+                no_speech,
             )
 
         if self.options.speculative_mode == "assistant":
@@ -694,15 +703,17 @@ class DecodingTask:
                 eot=self.tokenizer.eot,
                 logit_filters=self.logit_filters,
             )
+            no_speech = [np.nan]
+            if self.tokenizer.no_speech is not None:
+                no_speech = [
+                    float(
+                        mx.softmax(
+                            speculative.verifier.next_logits[:, self.sot_index], axis=-1
+                        )[0, self.tokenizer.no_speech].item()
+                    )
+                ]
             generated, sum_logprob = speculative.decode(self.sample_len)
             output = mx.array([prefix + generated])
-            no_speech = [
-                float(
-                    mx.softmax(
-                        speculative.verifier.next_logits[:, self.sot_index], axis=-1
-                    )[0, self.tokenizer.no_speech].item()
-                )
-            ] if self.tokenizer.no_speech is not None else [np.nan]
             return output, mx.array([sum_logprob]), no_speech
 
         n_batch = tokens.shape[0]

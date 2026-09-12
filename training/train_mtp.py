@@ -1,5 +1,6 @@
 """Small resumable MLX-native MTP trainer."""
 
+import json
 from pathlib import Path
 
 import mlx.core as mx
@@ -7,12 +8,14 @@ import mlx.optimizers as optim
 import mlx.nn as nn
 
 from lightning_whisper_mlx.mtp import MTPHead
+from lightning_whisper_mlx.mtp import MTPCheckpointMetadata
 
 
 class MTPTrainer:
     def __init__(self, hidden_size: int, vocabulary_size: int, horizons: int, learning_rate: float):
         self.head = MTPHead(hidden_size, horizons)
         self.optimizer = optim.Adam(learning_rate=learning_rate)
+        self.hidden_size = hidden_size
         self.vocabulary_size = vocabulary_size
         self.horizons = horizons
         mx.eval(self.head.parameters())
@@ -31,11 +34,41 @@ class MTPTrainer:
         mx.eval(self.head.parameters(), self.optimizer.state)
         return float(loss.item())
 
-    def save_checkpoint(self, path: Path):
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        weights = self.head.parameters()
-        mx.savez(str(temporary), **_flatten_weights(weights))
-        temporary.replace(path)
+    def save_checkpoint(
+        self,
+        path: Path,
+        *,
+        base_model_repository: str,
+        base_model_revision: str,
+        base_model_fingerprint: str,
+        tokenizer_fingerprint: str,
+        label_manifest_digest: str,
+        dataset_split_digest: str,
+        training_commit: str,
+        validation_metrics=None,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+        metadata = MTPCheckpointMetadata(
+            base_model_repository=base_model_repository,
+            base_model_revision=base_model_revision,
+            base_model_fingerprint=base_model_fingerprint,
+            decoder_hidden_size=self.hidden_size,
+            vocabulary_size=self.vocabulary_size,
+            tokenizer_fingerprint=tokenizer_fingerprint,
+            horizons=self.horizons,
+            weight_dtype="float32",
+            training_config={"learning_rate": float(self.optimizer.learning_rate.item())},
+            label_manifest_digest=label_manifest_digest,
+            dataset_split_digest=dataset_split_digest,
+            training_commit=training_commit,
+            validation_metrics=validation_metrics or {},
+        )
+        temporary = path / "weights.tmp"
+        mx.savez(str(temporary), **_flatten_weights(self.head.parameters()))
+        (path / "weights.tmp.npz").replace(path / "weights.npz")
+        metadata_tmp = path / "metadata.json.tmp"
+        metadata_tmp.write_text(json.dumps(metadata.to_dict(), sort_keys=True, indent=2))
+        metadata_tmp.replace(path / "metadata.json")
 
 
 def _flatten_weights(tree, prefix=""):

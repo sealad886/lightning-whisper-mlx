@@ -1,6 +1,7 @@
 """MTP heads and versioned checkpoint compatibility metadata."""
 
 import json
+import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict
@@ -79,14 +80,16 @@ def load_mtp_head(
     *,
     decoder_hidden_size: int,
     vocabulary_size: int,
+    base_model_fingerprint: str,
+    tokenizer_fingerprint: str,
 ):
     path = Path(checkpoint)
     with (path / "metadata.json").open() as stream:
         metadata = MTPCheckpointMetadata.from_dict(json.load(stream))
     validate_checkpoint_metadata(
         metadata,
-        base_model_fingerprint=metadata.base_model_fingerprint,
-        tokenizer_fingerprint=metadata.tokenizer_fingerprint,
+        base_model_fingerprint=base_model_fingerprint,
+        tokenizer_fingerprint=tokenizer_fingerprint,
         decoder_hidden_size=decoder_hidden_size,
         vocabulary_size=vocabulary_size,
     )
@@ -95,3 +98,16 @@ def load_mtp_head(
     head.update(weights)
     mx.eval(head.parameters())
     return head, metadata
+
+
+def fingerprint_tokenizer(tokenizer) -> str:
+    values = {
+        "eot": tokenizer.eot,
+        "sot": tokenizer.sot,
+        "sot_prev": tokenizer.sot_prev,
+        "timestamp_begin": tokenizer.timestamp_begin,
+        "transcribe": tokenizer.transcribe,
+        "translate": tokenizer.translate,
+        "no_timestamps": tokenizer.no_timestamps,
+    }
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()

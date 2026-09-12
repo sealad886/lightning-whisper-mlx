@@ -36,3 +36,19 @@ def test_assistant_proposer_tracks_and_resynchronizes_cache():
 
     proposer.synchronize(accepted=1, committed_tokens=[proposals[0], 7])
     assert proposer.cache_length == 4
+
+
+def test_assistant_proposer_discards_all_unaccepted_proposals():
+    prefix = mx.array([[1, 2]])
+    proposer = AssistantProposer(
+        model=make_model(),
+        audio_features=mx.random.normal((1, 3, 8)),
+        prefix=prefix,
+        lookahead=2,
+    )
+    proposals = proposer.propose()
+
+    proposer.synchronize(accepted=0, committed_tokens=[7])
+
+    assert len(proposals) == 2
+    assert proposer.cache_length == 3

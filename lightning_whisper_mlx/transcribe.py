@@ -20,7 +20,7 @@ from .audio import (
 )
 from .decoding import DecodingOptions, DecodingResult
 from .load_models import load_model
-from .mtp import load_mtp_head
+from .mtp import fingerprint_tokenizer, load_mtp_head
 from .timing import add_word_timestamps
 from .tokenizer import LANGUAGES, get_tokenizer
 
@@ -149,22 +149,12 @@ def transcribe_audio(
     dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
     model = ModelHolder.get_model(path_or_hf_repo, dtype)
 
+    assistant = None
     if decode_options.get("speculative_mode") == "assistant":
         assistant = decode_options.get("assistant_model")
         if isinstance(assistant, str):
             assistant = load_model(assistant, dtype=dtype)
             decode_options["assistant_model"] = assistant
-        if assistant.dims.n_vocab != model.dims.n_vocab:
-            raise ValueError("assistant and target models must share vocabulary size")
-        if assistant.dims.n_text_ctx < model.dims.n_text_ctx:
-            raise ValueError("assistant text context must cover target context")
-    elif decode_options.get("speculative_mode") == "mtp":
-        head, _ = load_mtp_head(
-            decode_options["mtp_checkpoint"],
-            decoder_hidden_size=model.dims.n_text_state,
-            vocabulary_size=model.dims.n_vocab,
-        )
-        decode_options["mtp_head"] = head
 
     # Pad 30-seconds of silence to the input audio, for slicing
     mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
@@ -205,6 +195,29 @@ def transcribe_audio(
         task=task,
     )
 
+    if assistant is not None:
+        if assistant.dims.n_vocab != model.dims.n_vocab:
+            raise ValueError("assistant and target models must share vocabulary size")
+        if assistant.dims.n_text_ctx < model.dims.n_text_ctx:
+            raise ValueError("assistant text context must cover target context")
+        assistant_tokenizer = get_tokenizer(
+            assistant.is_multilingual,
+            num_languages=assistant.num_languages,
+            language=language,
+            task=task,
+        )
+        if fingerprint_tokenizer(assistant_tokenizer) != fingerprint_tokenizer(tokenizer):
+            raise ValueError("assistant and target tokenizers are incompatible")
+    elif decode_options.get("speculative_mode") == "mtp":
+        head, _ = load_mtp_head(
+            decode_options["mtp_checkpoint"],
+            decoder_hidden_size=model.dims.n_text_state,
+            vocabulary_size=model.dims.n_vocab,
+            base_model_fingerprint=getattr(model, "_checkpoint_fingerprint", ""),
+            tokenizer_fingerprint=fingerprint_tokenizer(tokenizer),
+        )
+        decode_options["mtp_head"] = head
+
     if isinstance(clip_timestamps, str):
         clip_timestamps = [
             float(ts) for ts in (clip_timestamps.split(",") if clip_timestamps else [])
@@ -223,6 +236,14 @@ def transcribe_audio(
     
     def decode_process(segment_batch, t):
         kwargs = {**decode_options}
+        if t != 0 and kwargs.get("speculative_mode") != "none":
+            kwargs.update(
+                speculative_mode="none",
+                assistant_model=None,
+                assistant_quant=None,
+                mtp_checkpoint=None,
+                mtp_head=None,
+            )
         options = DecodingOptions(**kwargs, temperature=t)
         decode_results = model.decode(segment_batch, options)
         return decode_results
