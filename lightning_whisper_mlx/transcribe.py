@@ -20,6 +20,7 @@ from .audio import (
 )
 from .decoding import DecodingOptions, DecodingResult
 from .load_models import load_model
+from .mtp import load_mtp_head
 from .timing import add_word_timestamps
 from .tokenizer import LANGUAGES, get_tokenizer
 
@@ -147,6 +148,23 @@ def transcribe_audio(
 
     dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
     model = ModelHolder.get_model(path_or_hf_repo, dtype)
+
+    if decode_options.get("speculative_mode") == "assistant":
+        assistant = decode_options.get("assistant_model")
+        if isinstance(assistant, str):
+            assistant = load_model(assistant, dtype=dtype)
+            decode_options["assistant_model"] = assistant
+        if assistant.dims.n_vocab != model.dims.n_vocab:
+            raise ValueError("assistant and target models must share vocabulary size")
+        if assistant.dims.n_text_ctx < model.dims.n_text_ctx:
+            raise ValueError("assistant text context must cover target context")
+    elif decode_options.get("speculative_mode") == "mtp":
+        head, _ = load_mtp_head(
+            decode_options["mtp_checkpoint"],
+            decoder_hidden_size=model.dims.n_text_state,
+            vocabulary_size=model.dims.n_vocab,
+        )
+        decode_options["mtp_head"] = head
 
     # Pad 30-seconds of silence to the input audio, for slicing
     mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)

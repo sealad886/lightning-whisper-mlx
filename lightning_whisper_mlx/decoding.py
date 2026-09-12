@@ -10,6 +10,12 @@ import numpy as np
 from mlx.utils import tree_map
 
 from .audio import CHUNK_LENGTH
+from .speculative import (
+    AssistantSpeculativeDecoder,
+    MTPSpeculativeDecoder,
+    SpeculativeOptions,
+    validate_speculative_options,
+)
 from .tokenizer import Tokenizer, get_tokenizer
 
 
@@ -115,6 +121,15 @@ class DecodingOptions:
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
 
+    # lossless speculative decoding; disabled by default
+    speculative_mode: str = "none"
+    lookahead: int = 2
+    assistant_model: object = None
+    assistant_quant: Optional[str] = None
+    mtp_checkpoint: Optional[str] = None
+    mtp_head: object = None
+    speculative_batch_policy: str = "lockstep"
+
 
 @dataclass(frozen=True)
 class DecodingResult:
@@ -134,6 +149,7 @@ class Inference:
         self.model: "Whisper" = model
         self.initial_token_length = initial_token_length
         self.kv_cache = None
+        self.last_hidden = None
 
     def logits(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
         """Perform a forward pass on the decoder and return per-token logits"""
@@ -141,10 +157,59 @@ class Inference:
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
 
-        logits, self.kv_cache, _ = self.model.decoder(
+        logits, self.kv_cache, _, self.last_hidden = self.model.decoder(
             tokens, audio_features, kv_cache=self.kv_cache
         )
         return logits.astype(mx.float32)
+
+    def prefill(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
+        """Run the initial prompt without reducing it to its final token."""
+        if self.kv_cache is not None:
+            raise RuntimeError("prefill requires an empty inference cache")
+        return self.forward_block(tokens, audio_features)
+
+    def forward_one(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
+        """Decode one token against the current cache."""
+        if tokens.shape[-1] != 1:
+            raise ValueError("forward_one expects exactly one token")
+        return self.forward_block(tokens, audio_features)
+
+    def forward_block(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
+        """Decode a token block and append its self-attention cache."""
+        logits, self.kv_cache, _, self.last_hidden = self.model.decoder(
+            tokens, audio_features, kv_cache=self.kv_cache, return_hidden=True
+        )
+        return logits.astype(mx.float32)
+
+    @property
+    def cache_length(self) -> int:
+        if not self.kv_cache or self.kv_cache[0] is None:
+            return 0
+        self_kv = self.kv_cache[0][0]
+        return 0 if self_kv is None else self_kv[0].shape[1]
+
+    def truncate(self, length: int):
+        """Drop uncommitted self-attention cache entries."""
+        if length < 0 or length > self.cache_length:
+            raise ValueError("cache truncation length is outside the current cache")
+        if self.kv_cache is None:
+            if length:
+                raise ValueError("cannot retain entries in an empty cache")
+            return
+
+        truncated = []
+        for layer_cache in self.kv_cache:
+            if layer_cache is None:
+                truncated.append(None)
+                continue
+            self_kv, cross_kv = layer_cache
+            if self_kv is None:
+                truncated.append((None, cross_kv))
+            else:
+                truncated.append(
+                    ((self_kv[0][:, :length], self_kv[1][:, :length]), cross_kv)
+                )
+        self.kv_cache = truncated
 
     def rearrange_kv_cache(self, source_indices):
         """Update the key-value cache according to the updated beams"""
@@ -154,6 +219,7 @@ class Inference:
 
     def reset(self):
         self.kv_cache = None
+        self.last_hidden = None
 
 
 class SequenceRanker:
@@ -265,7 +331,6 @@ class GreedyDecoder(TokenDecoder):
         else:
             next_tokens = mx.random.categorical(logits=logits / self.temperature)
 
-        next_tokens = mx.argmax(logits, axis=-1)
         logits = logits.astype(mx.float32)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
@@ -475,6 +540,18 @@ class DecodingTask:
         ):
             raise ValueError("length_penalty (alpha) should be a value between 0 and 1")
 
+        validate_speculative_options(
+            SpeculativeOptions(
+                speculative_mode=options.speculative_mode,
+                lookahead=options.lookahead,
+                assistant_model=options.assistant_model,
+                assistant_quant=options.assistant_quant,
+                mtp_checkpoint=options.mtp_checkpoint,
+                speculative_batch_policy=options.speculative_batch_policy,
+            ),
+            temperature=options.temperature,
+        )
+
         return options
 
     def _get_initial_tokens(self) -> Tuple[int]:
@@ -569,7 +646,65 @@ class DecodingTask:
 
         return languages, lang_probs
 
-    def _main_loop(self, audio_features: mx.array, tokens: mx.array):
+    def _main_loop(
+        self,
+        audio_features: mx.array,
+        tokens: mx.array,
+        assistant_audio_features: Optional[mx.array] = None,
+    ):
+        if self.options.speculative_mode == "mtp":
+            if tokens.shape[0] != 1:
+                raise ValueError(
+                    "MTP speculative decoding currently requires batch_size=1"
+                )
+            if self.options.mtp_head is None:
+                raise ValueError("mtp mode requires a loaded MTP head")
+            prefix = tokens[0].tolist()
+            speculative = MTPSpeculativeDecoder(
+                model=self.model,
+                head=self.options.mtp_head,
+                audio_features=audio_features,
+                prefix=prefix,
+                lookahead=self.options.lookahead,
+                eot=self.tokenizer.eot,
+                logit_filters=self.logit_filters,
+            )
+            generated, sum_logprob = speculative.decode(self.sample_len)
+            return (
+                mx.array([prefix + generated]),
+                mx.array([sum_logprob]),
+                [np.nan],
+            )
+
+        if self.options.speculative_mode == "assistant":
+            if tokens.shape[0] != 1:
+                raise ValueError(
+                    "assistant speculative decoding currently requires batch_size=1"
+                )
+            if assistant_audio_features is None:
+                raise ValueError("assistant audio features are required")
+            prefix = tokens[0].tolist()
+            speculative = AssistantSpeculativeDecoder(
+                target_model=self.model,
+                assistant_model=self.options.assistant_model,
+                audio_features=audio_features,
+                assistant_audio_features=assistant_audio_features,
+                prefix=prefix,
+                lookahead=self.options.lookahead,
+                eot=self.tokenizer.eot,
+                logit_filters=self.logit_filters,
+            )
+            generated, sum_logprob = speculative.decode(self.sample_len)
+            output = mx.array([prefix + generated])
+            no_speech = [
+                float(
+                    mx.softmax(
+                        speculative.verifier.next_logits[:, self.sot_index], axis=-1
+                    )[0, self.tokenizer.no_speech].item()
+                )
+            ] if self.tokenizer.no_speech is not None else [np.nan]
+            return output, mx.array([sum_logprob]), no_speech
+
         n_batch = tokens.shape[0]
         sum_logprobs: mx.array = mx.zeros(n_batch)
         no_speech_probs = [np.nan] * n_batch
@@ -613,6 +748,9 @@ class DecodingTask:
         mel = mx.repeat(mel, repeats=1, axis=0)
         n_audio *= 1
 
+        assistant_audio_features = None
+        if self.options.speculative_mode == "assistant":
+            assistant_audio_features = self.options.assistant_model.encoder(mel)
         audio_features: mx.array = self._get_audio_features(mel)  # encoder forward pass
         tokens: np.array = np.array(self.initial_tokens)
         tokens = np.broadcast_to(tokens, (n_audio, len(self.initial_tokens))).copy()
@@ -641,7 +779,9 @@ class DecodingTask:
             )
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
+        tokens, sum_logprobs, no_speech_probs = self._main_loop(
+            audio_features, tokens, assistant_audio_features
+        )
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]

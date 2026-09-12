@@ -79,7 +79,7 @@ class MultiHeadAttention(nn.Module):
 
         qk = q @ k
         if mask is not None:
-            qk = qk + mask[:n_ctx, :n_ctx]
+            qk = qk + mask
         qk = qk.astype(mx.float32)
 
         w = mx.softmax(qk, axis=-1).astype(q.dtype)
@@ -173,7 +173,7 @@ class TextDecoder(nn.Module):
             dtype
         )
 
-    def __call__(self, x, xa, kv_cache=None):
+    def __call__(self, x, xa, kv_cache=None, return_hidden=False):
         """
         x : mx.array, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -181,21 +181,26 @@ class TextDecoder(nn.Module):
             the encoded audio features to be attended on
         """
         offset = kv_cache[0][0][0].shape[1] if kv_cache else 0
+        n_tokens = x.shape[-1]
         x = (
             self.token_embedding(x)
-            + self.positional_embedding[offset : offset + x.shape[-1]]
+            + self.positional_embedding[offset : offset + n_tokens]
         )
 
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
+        mask = self._mask[offset : offset + n_tokens, : offset + n_tokens]
         cross_qk = [None] * len(self.blocks)
         for e, block in enumerate(self.blocks):
             x, kv_cache[e], cross_qk[e] = block(
-                x, xa, mask=self._mask, kv_cache=kv_cache[e]
+                x, xa, mask=mask, kv_cache=kv_cache[e]
             )
 
-        x = self.ln(x)
-        return x @ self.token_embedding.weight.T, kv_cache, cross_qk
+        hidden = self.ln(x)
+        logits = hidden @ self.token_embedding.weight.T
+        if return_hidden:
+            return logits, kv_cache, cross_qk, hidden
+        return logits, kv_cache, cross_qk
 
 
 class Whisper(nn.Module):
@@ -246,6 +251,12 @@ class Whisper(nn.Module):
 
     def logits(self, tokens, audio_features):
         return self.decoder(tokens, audio_features)[0]
+
+    def logits_and_hidden(self, tokens, audio_features):
+        logits, _, _, hidden = self.decoder(
+            tokens, audio_features, return_hidden=True
+        )
+        return logits, hidden
 
     def forward_with_cross_qk(self, mel, tokens):
         logits, _, cross_qk = self.decoder(tokens, self.encoder(mel))
