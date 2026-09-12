@@ -15,7 +15,14 @@ setup(
         "torch",
         "tqdm",
         "more-itertools",
-        "tiktoken==0.3.3",
+        "tiktoken>=0.3.3,<1",
         "scipy"
     ],
+    extras_require={
+        'dev': [
+            'pytest',
+            'black',
+            'flake8'
+        ]
+    }
 )
