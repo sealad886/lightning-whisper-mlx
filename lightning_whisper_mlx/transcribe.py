@@ -68,7 +68,7 @@ def transcribe_audio(
     verbose: Optional[bool] = None,
     temperature: Union[float, Tuple[float, ...]] = (0.0, 1.0),
     compression_ratio_threshold: Optional[float] = 2.4,
-    logprob_threshold: Optional[float] = -1, 
+    logprob_threshold: Optional[float] = -1,
     no_speech_threshold: Optional[float] = 0.6,
     condition_on_previous_text: bool = True,
     initial_prompt: Optional[str] = None,
@@ -233,7 +233,7 @@ def transcribe_audio(
 
     if word_timestamps and task == "translate":
         warnings.warn("Word-level timestamps on translations may not be reliable.")
-    
+
     def decode_process(segment_batch, t):
         kwargs = {**decode_options}
         if t != 0 and kwargs.get("speculative_mode") != "none":
@@ -253,7 +253,7 @@ def transcribe_audio(
         final_decode = []
 
         for i, decode_result in enumerate(decode_results):
-            segment = segment_batch[i:i+1, :, :]  
+            segment = segment_batch[i:i+1, :, :]
             needs_fallback = False
             if (
                 compression_ratio_threshold is not None
@@ -265,13 +265,13 @@ def transcribe_audio(
                 logprob_threshold is not None
                 and decode_result.avg_logprob < logprob_threshold
             ):
-                needs_fallback = True  
+                needs_fallback = True
 
             if (
                 no_speech_threshold is not None
                 and decode_result.no_speech_prob > no_speech_threshold
             ):
-                needs_fallback = False  
+                needs_fallback = False
 
             if needs_fallback:
                 final_decode.append(decode_process(segment, 1.0)[0])
@@ -312,7 +312,7 @@ def transcribe_audio(
             "compression_ratio": res.compression_ratio,
             "no_speech_prob": res.no_speech_prob,
         }
-    
+
     def format_output(tokens, res):
         seek = 0
         current_segments = []
@@ -327,7 +327,7 @@ def transcribe_audio(
 
             if should_skip:
                 seek += (
-                    segment_size 
+                    segment_size
                 )
                 return current_segments, seek
 
@@ -428,7 +428,7 @@ def transcribe_audio(
                 segment["text"] = ""
                 segment["tokens"] = []
                 segment["words"] = []
-        
+
         return current_segments, seek
 
     seek_clip_end = seek_clips[0][1]
@@ -452,7 +452,7 @@ def transcribe_audio(
             mel_segment = pad_or_trim(mel_segment, N_FRAMES, axis=-2).astype(dtype)
             mel_segments.append(mel_segment)
             mel_timestamps.append((seek, seek + segment_size))
-        
+
         if not len(mel_segments):
             break
 
@@ -464,7 +464,7 @@ def transcribe_audio(
             start_seek, end_seek = mel_timestamps[index]
 
             tokens = np.array(res.tokens)
-            current_segments, value_seek = format_output(tokens, res) 
+            current_segments, value_seek = format_output(tokens, res)
 
             tokens =  [token
                     for segment in current_segments
@@ -472,7 +472,7 @@ def transcribe_audio(
             ]
 
             all_segments.append([start_seek, end_seek,tokenizer.decode(tokens)])
-               
+
             all_tokens.extend(
                 [
                     token

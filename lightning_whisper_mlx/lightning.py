@@ -1,43 +1,43 @@
 from .transcribe import transcribe_audio
 from .speculative import SpeculativeOptions, validate_speculative_options
-from huggingface_hub import hf_hub_download 
+from huggingface_hub import hf_hub_download
 
 models = {
     "tiny": {
-        "base": "mlx-community/whisper-tiny", 
-        "4bit": "mlx-community/whisper-tiny-mlx-4bit", 
+        "base": "mlx-community/whisper-tiny",
+        "4bit": "mlx-community/whisper-tiny-mlx-4bit",
         "8bit": "mlx-community/whisper-tiny-mlx-8bit"
-    }, 
+    },
     "small": {
-        "base": "mlx-community/whisper-small-mlx", 
-        "4bit": "mlx-community/whisper-small-mlx-4bit", 
+        "base": "mlx-community/whisper-small-mlx",
+        "4bit": "mlx-community/whisper-small-mlx-4bit",
         "8bit": "mlx-community/whisper-small-mlx-8bit"
     },
     "distil-small.en": {
-        "base": "mustafaaljadery/distil-whisper-mlx", 
+        "base": "mustafaaljadery/distil-whisper-mlx",
     },
     "base": {
-        "base" : "mlx-community/whisper-base-mlx", 
+        "base" : "mlx-community/whisper-base-mlx",
         "4bit" : "mlx-community/whisper-base-mlx-4bit",
         "8bit" : "mlx-community/whisper-base-mlx-8bit"
     },
     "medium": {
         "base": "mlx-community/whisper-medium-mlx",
-        "4bit": "mlx-community/whisper-medium-mlx-4bit", 
+        "4bit": "mlx-community/whisper-medium-mlx-4bit",
         "8bit": "mlx-community/whisper-medium-mlx-8bit"
-    }, 
+    },
     "distil-medium.en": {
-        "base": "mustafaaljadery/distil-whisper-mlx", 
-    }, 
+        "base": "mustafaaljadery/distil-whisper-mlx",
+    },
     "large": {
-        "base": "mlx-community/whisper-large-mlx", 
-        "4bit": "mlx-community/whisper-large-mlx-4bit", 
-        "8bit": "mlx-community/whisper-large-mlx-8bit", 
+        "base": "mlx-community/whisper-large-mlx",
+        "4bit": "mlx-community/whisper-large-mlx-4bit",
+        "8bit": "mlx-community/whisper-large-mlx-8bit",
     },
     "large-v2": {
         "base": "mlx-community/whisper-large-v2-mlx",
         "4bit": "mlx-community/whisper-large-v2-mlx-4bit",
-        "8bit": "mlx-community/whisper-large-v2-mlx-8bit", 
+        "8bit": "mlx-community/whisper-large-v2-mlx-8bit",
     },
     "distil-large-v2": {
         "base": "mustafaaljadery/distil-whisper-mlx",
@@ -45,7 +45,7 @@ models = {
     "large-v3": {
         "base": "mlx-community/whisper-large-v3-mlx",
         "4bit": "mlx-community/whisper-large-v3-mlx-4bit",
-        "8bit": "mlx-community/whisper-large-v3-mlx-8bit", 
+        "8bit": "mlx-community/whisper-large-v3-mlx-8bit",
     },
     "distil-large-v3": {
         "base": "mustafaaljadery/distil-whisper-mlx",
@@ -67,8 +67,8 @@ class LightningWhisperMLX():
     ):
         if quant and (quant != "4bit" and quant !="8bit"):
             raise ValueError("Quantization must be `4bit` or `8bit`")
-        
-        if model not in models: 
+
+        if model not in models:
             raise ValueError("Please select a valid model")
 
         if (
@@ -89,7 +89,7 @@ class LightningWhisperMLX():
             speculative_batch_policy=speculative_batch_policy,
         )
         validate_speculative_options(self.speculative_options, temperature=0.0)
-        
+
         self.name = model
         self.batch_size = batch_size
 
@@ -99,10 +99,10 @@ class LightningWhisperMLX():
             repo_id = models[model][quant]
         else:
             repo_id = models[model]['base']
-        
-        if quant and "distil" in model: 
-            if quant == "4bit": 
-                self.name += "-4-bit" 
+
+        if quant and "distil" in model:
+            if quant == "4bit":
+                self.name += "-4-bit"
             else:
                 self.name += "-8-bit"
 
@@ -117,7 +117,7 @@ class LightningWhisperMLX():
 
         hf_hub_download(repo_id=repo_id, filename=filename1, local_dir=local_dir)
         hf_hub_download(repo_id=repo_id, filename=filename2, local_dir=local_dir)
-    
+
     def transcribe(self, audio_path, language=None, **decode_options):
         options = {
             "speculative_mode": self.speculative_options.speculative_mode,
