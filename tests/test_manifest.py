@@ -62,9 +62,13 @@ def test_split_records_balances_independent_records_reproducibly():
 
     split = split_records(records, seed=7)
 
-    assert {name: sum(record["split"] == name for record in split)
-            for name in ("train", "validation", "test")} == {
-        "train": 80, "validation": 10, "test": 10,
+    assert {
+        name: sum(record["split"] == name for record in split)
+        for name in ("train", "validation", "test")
+    } == {
+        "train": 80,
+        "validation": 10,
+        "test": 10,
     }
     assert split == split_records(records, seed=7)
     assert all("split" not in record for record in records)
@@ -80,3 +84,24 @@ def test_split_records_keeps_transitive_speaker_and_digest_groups_together():
     split = split_records(records, seed=7)
 
     assert len({record["split"] for record in split}) == 1
+
+
+def test_unknown_speakers_do_not_form_one_split_group():
+    records = [
+        {"audio_digest": str(i), "speaker_id": [None, "", "unknown", " "][i % 4]}
+        for i in range(100)
+    ]
+    split = split_records(records, seed=3)
+    assert [
+        sum(record["split"] == name for record in split)
+        for name in ("train", "validation", "test")
+    ] == [80, 10, 10]
+
+
+def test_unknown_speakers_still_group_duplicate_digests():
+    records = [
+        {"audio_digest": "shared"},
+        {"audio_digest": "shared", "speaker_id": "known"},
+        {"audio_digest": "other", "speaker_id": "known"},
+    ]
+    assert len({record["split"] for record in split_records(records)}) == 1

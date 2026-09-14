@@ -72,9 +72,10 @@ def _record_from_metadata(shard: Path, metadata: Dict[str, object]) -> Dict[str,
 def split_records(records: List[Dict[str, object]], seed: int = 0) -> List[Dict[str, object]]:
     groups: Dict[str, set] = {}
     for index, record in enumerate(records):
-        speaker = str(record.get("speaker_id", "unknown"))
+        speaker = record.get("speaker_id")
         digest = str(record.get("audio_digest", record.get("record_id", index)))
-        groups.setdefault(f"speaker:{speaker}", set()).add(index)
+        if speaker is not None and str(speaker).strip().lower() not in ("", "unknown"):
+            groups.setdefault(f"speaker:{speaker}", set()).add(index)
         groups.setdefault(f"digest:{digest}", set()).add(index)
 
     components: List[set] = []

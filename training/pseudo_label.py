@@ -12,19 +12,21 @@ def _read_jsonl(path: Path):
         return [json.loads(line) for line in stream if line.strip()]
 
 
-def _atomic_jsonl(path: Path, records):
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w") as stream:
+def _append_jsonl(path: Path, records):
+    with path.open("a") as stream:
         for record in records:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
-    temporary.replace(path)
 
 
 def generate_pseudo_labels(
     records: Iterable[Dict[str, object]],
     teacher: Callable[[Dict[str, object]], Dict[str, object]],
     output_dir: Path,
+    *,
+    flush_every: int = 32,
 ):
+    if flush_every < 1:
+        raise ValueError("flush_every must be at least 1")
     output_dir.mkdir(parents=True, exist_ok=True)
     labels_path = output_dir / "labels.jsonl"
     failures_path = output_dir / "failures.jsonl"
@@ -34,28 +36,41 @@ def generate_pseudo_labels(
     failed_digests = {record["audio_digest"] for record in failures}
     counts = {"labeled": 0, "failed": 0, "skipped": 0}
 
-    for record in sorted(records, key=lambda value: str(value["audio_digest"])):
-        digest = record["audio_digest"]
-        if digest in labeled_digests:
-            counts["skipped"] += 1
-            continue
-        if digest in failed_digests:
-            counts["failed"] += 1
-            continue
-        try:
-            label = teacher(record)
-            labels.append({**record, **label, "audio_digest": digest})
-            labeled_digests.add(digest)
-            counts["labeled"] += 1
-        except Exception as error:  # record a failed ledger entry and continue
-            failures.append(
-                {"audio_digest": digest, "error": f"{type(error).__name__}: {error}"}
-            )
-            failed_digests.add(digest)
-            counts["failed"] += 1
+    pending_labels = []
+    pending_failures = []
 
-    _atomic_jsonl(labels_path, sorted(labels, key=lambda value: value["audio_digest"]))
-    _atomic_jsonl(
-        failures_path, sorted(failures, key=lambda value: value["audio_digest"])
-    )
+    def flush():
+        _append_jsonl(labels_path, pending_labels)
+        pending_labels.clear()
+        _append_jsonl(failures_path, pending_failures)
+        pending_failures.clear()
+
+    try:
+        for record in sorted(records, key=lambda value: str(value["audio_digest"])):
+            digest = record["audio_digest"]
+            if digest in labeled_digests:
+                counts["skipped"] += 1
+                continue
+            if digest in failed_digests:
+                counts["failed"] += 1
+                continue
+            try:
+                label = teacher(record)
+                pending_labels.append({**record, **label, "audio_digest": digest})
+                labeled_digests.add(digest)
+                counts["labeled"] += 1
+            except Exception as error:  # record a failed ledger entry and continue
+                pending_failures.append(
+                    {
+                        "audio_digest": digest,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+                failed_digests.add(digest)
+                counts["failed"] += 1
+
+            if len(pending_labels) + len(pending_failures) >= flush_every:
+                flush()
+    finally:
+        flush()
     return counts

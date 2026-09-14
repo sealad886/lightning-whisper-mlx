@@ -1,7 +1,8 @@
-"""Small resumable MLX-native MTP trainer."""
+"""Small MLX-native MTP trainer with immutable inference checkpoint export."""
 
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import mlx.core as mx
 import mlx.optimizers as optim
@@ -12,7 +13,13 @@ from lightning_whisper_mlx.mtp import MTPCheckpointMetadata
 
 
 class MTPTrainer:
-    def __init__(self, hidden_size: int, vocabulary_size: int, horizons: int, learning_rate: float):
+    def __init__(
+        self,
+        hidden_size: int,
+        vocabulary_size: int,
+        horizons: int,
+        learning_rate: float,
+    ):
         self.head = MTPHead(hidden_size, horizons)
         self.optimizer = optim.Adam(learning_rate=learning_rate)
         self.hidden_size = hidden_size
@@ -28,7 +35,9 @@ class MTPTrainer:
 
         self._loss_and_grad = nn.value_and_grad(self.head, loss_fn)
 
-    def train_step(self, hidden: mx.array, embedding: mx.array, targets: mx.array) -> float:
+    def train_step(
+        self, hidden: mx.array, embedding: mx.array, targets: mx.array
+    ) -> float:
         loss, grads = self._loss_and_grad(hidden, embedding, targets)
         self.optimizer.update(self.head, grads)
         mx.eval(self.head.parameters(), self.optimizer.state)
@@ -47,7 +56,9 @@ class MTPTrainer:
         training_commit: str,
         validation_metrics=None,
     ):
-        path.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            raise FileExistsError(f"checkpoint destination already exists: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
         metadata = MTPCheckpointMetadata(
             base_model_repository=base_model_repository,
             base_model_revision=base_model_revision,
@@ -57,18 +68,27 @@ class MTPTrainer:
             tokenizer_fingerprint=tokenizer_fingerprint,
             horizons=self.horizons,
             weight_dtype="float32",
-            training_config={"learning_rate": float(self.optimizer.learning_rate.item())},
+            training_config={
+                "learning_rate": float(self.optimizer.learning_rate.item())
+            },
             label_manifest_digest=label_manifest_digest,
             dataset_split_digest=dataset_split_digest,
             training_commit=training_commit,
             validation_metrics=validation_metrics or {},
         )
-        temporary = path / "weights.tmp"
-        mx.savez(str(temporary), **_flatten_weights(self.head.parameters()))
-        (path / "weights.tmp.npz").replace(path / "weights.npz")
-        metadata_tmp = path / "metadata.json.tmp"
-        metadata_tmp.write_text(json.dumps(metadata.to_dict(), sort_keys=True, indent=2))
-        metadata_tmp.replace(path / "metadata.json")
+        with TemporaryDirectory(prefix=f".{path.name}-", dir=path.parent) as directory:
+            temporary = Path(directory) / "checkpoint"
+            temporary.mkdir()
+            mx.savez(
+                str(temporary / "weights.npz"),
+                **_flatten_weights(self.head.parameters()),
+            )
+            (temporary / "metadata.json").write_text(
+                json.dumps(metadata.to_dict(), sort_keys=True, indent=2)
+            )
+            if path.exists():
+                raise FileExistsError(f"checkpoint destination already exists: {path}")
+            temporary.rename(path)
 
 
 def _flatten_weights(tree, prefix=""):
