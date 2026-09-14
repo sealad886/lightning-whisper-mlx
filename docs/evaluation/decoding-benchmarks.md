@@ -27,8 +27,10 @@ working-tree changes; a commit hash alone does not identify a dirty run.
 
 ## CLI
 
-The CLI requires an explicit `module:function` runner. This prevents accidental
-model downloads or hidden data selection during imports:
+The CLI requires an explicit `module:function` runner. Resolving it executes the
+selected module's import code. Runner modules must avoid import-time model loading,
+downloads, and fixture selection; the adapter cannot enforce this for arbitrary
+user-supplied modules:
 
 ```bash
 python -m benchmarks.benchmark_decoding \
@@ -123,7 +125,7 @@ The JSON separately records the 1.2x median speed threshold for each comparison.
 
 | Gate | Required evidence | Current status |
 | --- | --- | --- |
-| Synthetic correctness | All native regressions pass on final source | 70 passed locally on 2026-09-14; rerun for final reviewed source if changed |
+| Synthetic correctness | All native regressions pass on final source | 81 passed locally on 2026-09-14; rerun for final reviewed source if changed |
 | Lossless clip decode | Every baseline and candidate repetition matches tokens/text/language | Pending real assets/window |
 | Performance | At least 1.2x median speedup in each promoted bucket, reproduced across independent passes | Unmeasured |
 | Stability | No OOM/crash; stable baseline durations and uncontended runs | Unmeasured |

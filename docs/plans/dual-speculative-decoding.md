@@ -19,8 +19,8 @@ organized by testable slices:
 - Implemented: retained per-repetition benchmark evidence and explicit local
   model/held-out-clip comparison runner. See the
   [benchmark runbook](../evaluation/decoding-benchmarks.md).
-- Verified locally: 70 tests passed, including small synthetic MLX models, in
-  4.55 seconds. This is correctness evidence, not a performance measurement.
+- Verified locally after round-one fixes: 81 tests passed, including small synthetic
+  MLX models, in 3.92 seconds. This is correctness evidence, not a performance measurement.
 - Pending: independent review of the final committed changes and PR publication.
 - Blocked on an uncontended machine window and selected assets: real-model
   token/timestamp equality, repeated timing, memory/stability, long-form API/CLI

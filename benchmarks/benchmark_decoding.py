@@ -12,7 +12,7 @@ from .runner import BenchmarkCase, BenchmarkConfig, BenchmarkSuite
 
 
 def load_runner(specification: str) -> Callable:
-    """Load an explicit ``module:function`` runner without loading models."""
+    """Import a runner; its module must avoid model/data work at import time."""
     try:
         module_name, function_name = specification.split(":", 1)
     except ValueError as error:
