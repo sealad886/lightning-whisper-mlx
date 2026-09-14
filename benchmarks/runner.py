@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from importlib.metadata import PackageNotFoundError, version
 import platform
+from pathlib import Path
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -35,9 +38,7 @@ class BenchmarkCase:
 class BenchmarkConfig:
     """Execution policy; defaults avoid network work and noisy single samples."""
 
-    cases: tuple[BenchmarkCase, ...] = field(
-        default_factory=lambda: (BenchmarkCase(),)
-    )
+    cases: tuple[BenchmarkCase, ...] = field(default_factory=lambda: (BenchmarkCase(),))
     warmups: int = 1
     repetitions: int = 3
 
@@ -61,6 +62,7 @@ class BenchmarkResult:
     metadata: Mapping[str, Any]
     output: Any = None
     token_count: Optional[int] = None
+    outputs: tuple[Any, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -72,7 +74,7 @@ class BenchmarkResult:
         return json.dumps(self.to_dict(), sort_keys=True)
 
 
-def environment_metadata() -> dict[str, str]:
+def environment_metadata() -> dict[str, Any]:
     """Return stable local metadata without model loading or network access."""
     try:
         revision = subprocess.run(
@@ -80,19 +82,29 @@ def environment_metadata() -> dict[str, str]:
             check=True,
             capture_output=True,
             text=True,
+            cwd=Path(__file__).resolve().parents[1],
         ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=Path(__file__).resolve().parents[1],
+            ).stdout.strip()
+        )
     except (OSError, subprocess.CalledProcessError):
         revision = "unknown"
+        dirty = None
 
     try:
-        import mlx
-
-        mlx_version = getattr(mlx, "__version__", "unknown")
-    except ImportError:
+        mlx_version = version("mlx")
+    except PackageNotFoundError:
         mlx_version = "unavailable"
 
     return {
         "git_revision": revision,
+        "git_dirty": dirty,
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "mlx_version": mlx_version,
@@ -131,10 +143,13 @@ def run_benchmark(
     durations = []
     output = None
     token_count = None
+    outputs = []
     for _ in range(repetitions):
         start = time.perf_counter()
-        output, token_count = _normalize_output(runner(case))
+        value = runner(case)
         durations.append(time.perf_counter() - start)
+        output, token_count = _normalize_output(value)
+        outputs.append(deepcopy(output))
 
     return BenchmarkResult(
         case=case,
@@ -143,9 +158,10 @@ def run_benchmark(
         median_seconds=median(durations),
         min_seconds=min(durations),
         max_seconds=max(durations),
-        metadata={**environment_metadata(), **(metadata or {})},
+        metadata={**(metadata or {}), **environment_metadata()},
         output=output,
         token_count=token_count,
+        outputs=tuple(outputs),
     )
 
 

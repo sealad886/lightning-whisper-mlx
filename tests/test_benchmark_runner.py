@@ -51,3 +51,29 @@ def test_counts_must_be_nonnegative_and_repetitions_positive():
         BenchmarkConfig(warmups=-1)
     with pytest.raises(ValueError, match="repetitions"):
         BenchmarkConfig(repetitions=0)
+
+
+def test_each_repetition_preserves_its_output_even_when_runner_reuses_mapping():
+    output = {"tokens": []}
+
+    def runner(case):
+        output["tokens"].append(len(output["tokens"]))
+        return output
+
+    result = run_benchmark(runner, BenchmarkCase(), warmups=0, repetitions=3)
+
+    assert [value["tokens"] for value in result.outputs] == [[0], [0, 1], [0, 1, 2]]
+
+
+def test_caller_metadata_cannot_replace_measured_provenance():
+    result = run_benchmark(
+        lambda case: None,
+        BenchmarkCase(),
+        warmups=0,
+        repetitions=1,
+        metadata={"git_revision": "invented", "fixture": "speech"},
+    )
+
+    assert result.metadata["git_revision"] != "invented"
+    assert result.metadata["fixture"] == "speech"
+    assert result.metadata["mlx_version"] not in {"unknown", ""}
