@@ -28,8 +28,12 @@ def _metadata_records(path: Path) -> Iterable[Dict[str, object]]:
 
 
 def _record_from_metadata(shard: Path, metadata: Dict[str, object]) -> Dict[str, object]:
-    relative = Path(str(metadata["audio_path"]))
-    audio_path = relative if relative.is_absolute() else shard / relative
+    shard = shard.resolve()
+    audio_path = (shard / Path(str(metadata["audio_path"]))).resolve()
+    try:
+        relative = audio_path.relative_to(shard)
+    except ValueError as error:
+        raise ValueError("metadata audio_path escapes its source shard") from error
     record_id = hashlib.sha256(
         f"{shard.name}:{relative.as_posix()}".encode()
     ).hexdigest()[:24]
@@ -53,7 +57,7 @@ def _record_from_metadata(shard: Path, metadata: Dict[str, object]) -> Dict[str,
     audio_digest = _digest(audio_path) if status != "unreadable" else ""
     return {
         "record_id": record_id,
-        "relative_audio_path": audio_path.as_posix(),
+        "relative_audio_path": relative.as_posix(),
         "source_path": str(shard),
         "source_dataset": metadata.get("source_dataset", "unknown"),
         "speaker_id": metadata.get("speaker_id", "unknown"),

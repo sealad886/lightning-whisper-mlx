@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from training.dataset import iter_teacher_examples
 
 
@@ -44,3 +46,11 @@ def test_teacher_examples_skip_incomplete_horizons_and_non_training_labels(tmp_p
     ]
 
     assert list(iter_teacher_examples(manifest, labels, horizons=2)) == []
+
+
+@pytest.mark.parametrize("horizons", [0, -1, -10])
+def test_teacher_examples_reject_nonpositive_horizons_before_reading_labels(
+    tmp_path, horizons
+):
+    with pytest.raises(ValueError, match="horizons must be at least 1"):
+        list(iter_teacher_examples([], tmp_path / "missing.jsonl", horizons=horizons))

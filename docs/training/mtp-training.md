@@ -35,3 +35,17 @@ then published together with a directory rename. Existing destinations are refus
 use a new path for each export. Failed exports leave previous checkpoints unchanged.
 These exports do not include optimizer state and cannot resume training. Optimizer
 resume remains unimplemented in this foundation.
+
+Manifest source references use an absolute, resolved shard directory in `source_path`
+and a shard-relative path in `relative_audio_path`. Resolve source audio with
+`Path(record["source_path"]) / record["relative_audio_path"]`, independently of the
+current working directory. Metadata references outside their shard, including
+symlinks escaping it, are rejected before loading audio. Absolute metadata paths
+inside the shard are normalized to the same relative reference.
+
+Older generated manifests may contain shard-prefixed or absolute values in
+`relative_audio_path`. Back up those manifests locally and regenerate them from
+source metadata before reuse; do not infer their original working directory.
+No generated manifests are tracked here, and source caches are not modified.
+Teacher-example generation requires `horizons >= 1` and rejects invalid values
+before reading label files.

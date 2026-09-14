@@ -1,4 +1,7 @@
 import json
+from pathlib import Path
+
+import pytest
 
 import numpy as np
 
@@ -105,3 +108,61 @@ def test_unknown_speakers_still_group_duplicate_digests():
         {"audio_digest": "other", "speaker_id": "known"},
     ]
     assert len({record["split"] for record in split_records(records)}) == 1
+
+
+def test_manifest_source_references_resolve_independently_of_working_directory(
+    tmp_path, monkeypatch
+):
+    shard = tmp_path / "cache" / "speech" / "shard_000"
+    nested = shard / "nested"
+    nested.mkdir(parents=True)
+    audio = nested / "audio.npy"
+    np.save(audio, np.ones(160, dtype=np.float32))
+    (shard / "__paths__.json").write_text(
+        json.dumps(
+            [
+                {"audio_path": "nested/audio.npy"},
+                {"audio_path": str(audio)},
+            ]
+        )
+    )
+    invocation_dir = tmp_path / "invocation"
+    invocation_dir.mkdir()
+    monkeypatch.chdir(invocation_dir)
+    output = tmp_path / "manifest.jsonl"
+
+    assert build_manifest(Path("../cache"), output) == 2
+    monkeypatch.chdir(tmp_path)
+    records = read_manifest(output)
+    for record in records:
+        assert record["source_path"] == str(shard.resolve())
+        assert record["relative_audio_path"] == "nested/audio.npy"
+        reference = Path(record["source_path"]) / record["relative_audio_path"]
+        assert reference == audio
+        assert np.array_equal(np.load(reference), np.ones(160, dtype=np.float32))
+    assert records[0]["record_id"] == records[1]["record_id"]
+
+
+@pytest.mark.parametrize("escape", ["parent", "absolute", "symlink"])
+def test_manifest_rejects_escaping_audio_before_reading(tmp_path, monkeypatch, escape):
+    shard = tmp_path / "speech" / "shard_000"
+    shard.mkdir(parents=True)
+    outside = tmp_path / "outside.npy"
+    if escape == "parent":
+        audio_path = "../../outside.npy"
+    elif escape == "absolute":
+        audio_path = str(outside)
+    else:
+        (shard / "linked.npy").symlink_to(outside)
+        audio_path = "linked.npy"
+    (shard / "__paths__.json").write_text(json.dumps([{"audio_path": audio_path}]))
+    output = tmp_path / "manifest.jsonl"
+    output.write_text("previous manifest")
+
+    def unexpected_audio_read(*args, **kwargs):
+        pytest.fail("escaping source audio must not be read")
+
+    monkeypatch.setattr(np, "load", unexpected_audio_read)
+    with pytest.raises(ValueError, match="escapes"):
+        build_manifest(tmp_path, output)
+    assert output.read_text() == "previous manifest"

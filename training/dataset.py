@@ -8,6 +8,8 @@ from typing import Dict, Iterable
 def iter_teacher_examples(
     manifest: Iterable[Dict[str, object]], labels_path: Path, horizons: int
 ):
+    if horizons < 1:
+        raise ValueError("horizons must be at least 1")
     labels = {}
     with labels_path.open() as stream:
         for line in stream:
