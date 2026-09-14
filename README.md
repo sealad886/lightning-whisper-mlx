@@ -41,6 +41,8 @@ an assistant model with a compatible tokenizer vocabulary; MTP mode requires a
 versioned checkpoint produced by the training tools.
 
 ```python
+from lightning_whisper_mlx import LightningWhisperMLX
+
 whisper = LightningWhisperMLX(
 	model="base",
 	speculative_mode="assistant",

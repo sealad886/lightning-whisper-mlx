@@ -94,11 +94,11 @@ def test_run_transcription_writes_outputs_and_continues_after_failure(tmp_path):
         calls.append(path)
         if path == second:
             raise RuntimeError("broken input")
-        return {"text": "hello"}
+        return {"text": "héllo 世界"}
 
     failures = run_transcription([first, second], transcriber, output_dir=output_dir)
 
-    assert (output_dir / "a.txt").read_text() == "hello\n"
+    assert (output_dir / "a.txt").read_text(encoding="utf-8") == "héllo 世界\n"
     assert calls == [first, second]
     assert [(path, str(error)) for path, error in failures] == [
         (second, "broken input")

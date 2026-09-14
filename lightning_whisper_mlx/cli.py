@@ -192,7 +192,8 @@ def run_transcription(
             else:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_text(
-                    text + ("\n" if text and not text.endswith("\n") else "")
+                    text + ("\n" if text and not text.endswith("\n") else ""),
+                    encoding="utf-8",
                 )
         except Exception as error:
             failures.append((source, error))
