@@ -4,7 +4,7 @@ import json
 import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict
+from typing import Callable, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -22,11 +22,13 @@ class MTPHead(nn.Module):
         ]
         self.norms = [nn.LayerNorm(hidden_size) for _ in range(horizons)]
 
-    def __call__(self, hidden: mx.array, embedding_weight: mx.array) -> mx.array:
+    def __call__(
+        self, hidden: mx.array, output_projection: Callable[[mx.array], mx.array]
+    ) -> mx.array:
         outputs = []
         for projection, norm in zip(self.projections, self.norms):
             future_hidden = hidden + projection(nn.gelu(norm(hidden)))
-            outputs.append(future_hidden @ embedding_weight.T)
+            outputs.append(output_projection(future_hidden))
         return mx.stack(outputs, axis=-2)
 
 

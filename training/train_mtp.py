@@ -28,7 +28,7 @@ class MTPTrainer:
         mx.eval(self.head.parameters())
 
         def loss_fn(hidden, embedding, targets):
-            logits = self.head(hidden, embedding)
+            logits = self.head(hidden, lambda future_hidden: future_hidden @ embedding.T)
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             selected = mx.take_along_axis(logprobs, targets[..., None], axis=-1)
             return -selected.mean()

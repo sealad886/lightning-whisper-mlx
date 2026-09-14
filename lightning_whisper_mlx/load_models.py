@@ -28,7 +28,6 @@ def load_model(
     model_args = whisper.ModelDimensions(**config)
 
     weights = mx.load(str(model_path / "weights.npz"))
-    weights = tree_unflatten(list(weights.items()))
 
     model = whisper.Whisper(model_args, dtype)
 
@@ -39,7 +38,7 @@ def load_model(
         )
         nn.quantize(model, **quantization, class_predicate=class_predicate)
 
-    model.update(weights)
+    model.update(tree_unflatten(list(weights.items())))
     mx.eval(model.parameters())
     digest = hashlib.sha256()
     for filename in ("config.json", "weights.npz"):

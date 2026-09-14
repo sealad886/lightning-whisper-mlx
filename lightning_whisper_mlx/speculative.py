@@ -201,11 +201,11 @@ class AssistantSpeculativeDecoder:
 class MTPProposer:
     """Generate future-token proposals from the target decoder hidden state."""
 
-    def __init__(self, *, inference, next_logits, head, embedding_weight, lookahead: int):
+    def __init__(self, *, inference, next_logits, head, output_projection, lookahead: int):
         self.inference = inference
         self.next_logits = next_logits
         self.head = head
-        self.embedding_weight = embedding_weight
+        self.output_projection = output_projection
         self.lookahead = lookahead
 
     def propose(self, max_tokens: Optional[int] = None) -> List[int]:
@@ -219,7 +219,7 @@ class MTPProposer:
         if self.inference.last_hidden is None:
             raise RuntimeError("MTP proposal requires decoder hidden states")
         future_logits = self.head(
-            self.inference.last_hidden[:, -1:], self.embedding_weight
+            self.inference.last_hidden[:, -1:], self.output_projection
         )[0, 0]
         for logits in future_logits[:width - 1]:
             proposals.append(int(mx.argmax(logits, axis=-1).item()))
@@ -248,7 +248,7 @@ class MTPSpeculativeDecoder:
             inference=inference,
             next_logits=next_logits,
             head=head,
-            embedding_weight=model.decoder.token_embedding.weight,
+            output_projection=model.decoder.token_embedding.as_linear,
             lookahead=lookahead,
         )
         self.verifier = CachedGreedyVerifier(

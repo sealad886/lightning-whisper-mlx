@@ -197,7 +197,7 @@ class TextDecoder(nn.Module):
             )
 
         hidden = self.ln(x)
-        logits = hidden @ self.token_embedding.weight.T
+        logits = self.token_embedding.as_linear(hidden)
         if return_hidden:
             return logits, kv_cache, cross_qk, hidden
         return logits, kv_cache, cross_qk

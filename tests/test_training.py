@@ -1,5 +1,6 @@
 import mlx.core as mx
 import pytest
+from mlx.utils import tree_flatten
 
 from lightning_whisper_mlx.mtp import load_mtp_head
 
@@ -13,11 +14,21 @@ def test_mtp_trainer_updates_only_head_and_returns_loss():
     hidden = mx.random.normal((1, 2, 4))
     embedding = mx.random.normal((8, 4))
     targets = mx.array([[[1, 2], [3, 4]]])
+    before = {
+        name: mx.array(value) for name, value in tree_flatten(trainer.head.parameters())
+    }
+    embedding_before = mx.array(embedding)
+    mx.eval(before, embedding_before)
 
     loss = trainer.train_step(hidden, embedding, targets)
 
     assert isinstance(loss, float)
     assert loss >= 0.0
+    assert any(
+        not mx.array_equal(before[name], value).item()
+        for name, value in tree_flatten(trainer.head.parameters())
+    )
+    assert mx.array_equal(embedding, embedding_before).item()
 
 
 def test_mtp_trainer_writes_runtime_loadable_checkpoint(tmp_path, monkeypatch):
@@ -49,8 +60,11 @@ def test_mtp_trainer_writes_runtime_loadable_checkpoint(tmp_path, monkeypatch):
     )
     hidden = mx.ones((1, 1, 4))
     embedding = mx.ones((8, 4))
+    def output_projection(future_hidden):
+        return future_hidden @ embedding.T
+
     assert mx.array_equal(
-        loaded(hidden, embedding), trainer.head(hidden, embedding)
+        loaded(hidden, output_projection), trainer.head(hidden, output_projection)
     ).item()
 
     original = {file.name: file.read_bytes() for file in checkpoint.iterdir()}

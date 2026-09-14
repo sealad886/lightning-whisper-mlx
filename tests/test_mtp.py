@@ -13,7 +13,7 @@ def test_mtp_head_returns_one_logit_matrix_per_future_horizon():
     hidden = mx.random.normal((1, 3, 8))
     embedding = mx.random.normal((32, 8))
 
-    logits = head(hidden, embedding)
+    logits = head(hidden, lambda future_hidden: future_hidden @ embedding.T)
 
     assert logits.shape == (1, 3, 2, 32)
 

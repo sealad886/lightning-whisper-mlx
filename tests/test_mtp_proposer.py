@@ -25,12 +25,25 @@ def test_mtp_proposer_uses_target_hidden_state():
     inference = Inference(model, initial_token_length=2)
     audio = mx.random.normal((1, 3, 8))
     next_logits = inference.prefill(mx.array([[1, 2]]), audio)
+    head = MTPHead(hidden_size=8, horizons=1)
+    observed_hidden = []
+
+    def observe_head(hidden, output_projection):
+        observed_hidden.append(hidden)
+        return head(hidden, output_projection)
+
     proposer = MTPProposer(
         inference=inference,
         next_logits=next_logits,
-        head=MTPHead(hidden_size=8, horizons=1),
-        embedding_weight=model.decoder.token_embedding.weight,
+        head=observe_head,
+        output_projection=model.decoder.token_embedding.as_linear,
         lookahead=2,
     )
 
     assert len(proposer.propose()) == 2
+    assert mx.array_equal(observed_hidden[-1], inference.last_hidden[:, -1:]).item()
+
+    # Advancing committed target history must update the head's conditioning.
+    proposer.next_logits = inference.forward_one(mx.array([[3]]), audio)
+    assert len(proposer.propose()) == 2
+    assert mx.array_equal(observed_hidden[-1], inference.last_hidden[:, -1:]).item()
