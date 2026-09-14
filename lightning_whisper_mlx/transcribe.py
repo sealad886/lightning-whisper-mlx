@@ -198,6 +198,8 @@ def transcribe_audio(
     if assistant is not None:
         if assistant.dims.n_vocab != model.dims.n_vocab:
             raise ValueError("assistant and target models must share vocabulary size")
+        if assistant.dims.n_mels != model.dims.n_mels:
+            raise ValueError("assistant and target models must share mel bin count")
         if assistant.dims.n_text_ctx < model.dims.n_text_ctx:
             raise ValueError("assistant text context must cover target context")
         assistant_tokenizer = get_tokenizer(

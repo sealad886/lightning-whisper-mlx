@@ -609,9 +609,6 @@ class DecodingTask:
         return tuple(sorted(set(suppress_tokens)))
 
     def _get_audio_features(self, mel: mx.array):
-        if self.options.fp16:
-            mel = mel.astype(mx.float16)
-
         if mel.shape[-2:] == (
             self.model.dims.n_audio_ctx,
             self.model.dims.n_audio_state,
@@ -750,6 +747,8 @@ class DecodingTask:
 
     def run(self, mel: mx.array) -> List[DecodingResult]:
         self.decoder.reset()
+        if self.options.fp16:
+            mel = mel.astype(mx.float16)
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
 

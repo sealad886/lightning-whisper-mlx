@@ -1,4 +1,5 @@
 import inspect
+import pytest
 
 from lightning_whisper_mlx import LightningWhisperMLX
 
@@ -11,3 +12,66 @@ def test_lightning_api_exposes_speculative_configuration():
     assert parameters["assistant_model"].default is None
     assert parameters["mtp_checkpoint"].default is None
     assert parameters["speculative_batch_policy"].default == "lockstep"
+
+
+@pytest.mark.parametrize("quant", [None, "4bit", "8bit"])
+def test_assistant_alias_resolves_for_all_supported_quantization(quant, monkeypatch):
+    from lightning_whisper_mlx import lightning
+
+    monkeypatch.setattr(lightning, "hf_hub_download", lambda **kwargs: None)
+    model = LightningWhisperMLX(
+        model="base",
+        speculative_mode="assistant",
+        assistant_model="tiny",
+        assistant_quant=quant,
+        batch_size=1,
+    )
+    assert (
+        model.speculative_options.assistant_model
+        == lightning.models["tiny"][quant or "base"]
+    )
+
+
+@pytest.mark.parametrize("mode", ["assistant", "mtp"])
+def test_speculative_batch_rejected_before_download(mode, monkeypatch):
+    from lightning_whisper_mlx import lightning
+
+    def unexpected_download(**kwargs):
+        pytest.fail("invalid configuration must not start a download")
+
+    monkeypatch.setattr(lightning, "hf_hub_download", unexpected_download)
+    with pytest.raises(ValueError, match="batch_size=1"):
+        LightningWhisperMLX(
+            model="base",
+            speculative_mode=mode,
+            assistant_model="tiny" if mode == "assistant" else None,
+            mtp_checkpoint="head" if mode == "mtp" else None,
+            batch_size=2,
+        )
+
+
+def test_transcription_rejects_assistant_with_different_mel_bins(monkeypatch):
+    from types import SimpleNamespace
+    import mlx.core as mx
+    from lightning_whisper_mlx import transcribe
+
+    def model(n_mels):
+        return SimpleNamespace(
+            dims=SimpleNamespace(n_mels=n_mels, n_vocab=51865, n_text_ctx=16),
+            is_multilingual=True,
+            num_languages=99,
+        )
+
+    monkeypatch.setattr(transcribe.ModelHolder, "get_model", lambda *args: model(80))
+    monkeypatch.setattr(transcribe, "load_model", lambda *args, **kwargs: model(128))
+    monkeypatch.setattr(
+        transcribe, "log_mel_spectrogram", lambda *args, **kwargs: mx.zeros((3000, 80))
+    )
+    with pytest.raises(ValueError, match="mel bin count"):
+        transcribe.transcribe_audio(
+            "unused.wav",
+            batch_size=1,
+            language="en",
+            speculative_mode="assistant",
+            assistant_model="local-assistant",
+        )
