@@ -60,10 +60,12 @@ def normalize_output_dir(value: Optional[str | Path]):
     """Return None for adjacent output, a sentinel for stdout, or a Path."""
     if value is None:
         return None
+    if value is STDOUT_OUTPUT:
+        return STDOUT_OUTPUT
     text = str(value)
     if text in {"", "''", '""'}:
         return STDOUT_OUTPUT
-    return Path(value)
+    return Path(text)
 
 
 def output_path_for(

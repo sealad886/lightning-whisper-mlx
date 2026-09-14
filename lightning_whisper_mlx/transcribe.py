@@ -211,8 +211,11 @@ def transcribe_audio(
         if fingerprint_tokenizer(assistant_tokenizer) != fingerprint_tokenizer(tokenizer):
             raise ValueError("assistant and target tokenizers are incompatible")
     elif decode_options.get("speculative_mode") == "mtp":
+        checkpoint = decode_options.get("mtp_checkpoint")
+        if not checkpoint:
+            raise ValueError("mtp mode requires mtp_checkpoint")
         head, _ = load_mtp_head(
-            decode_options["mtp_checkpoint"],
+            checkpoint,
             decoder_hidden_size=model.dims.n_text_state,
             vocabulary_size=model.dims.n_vocab,
             base_model_fingerprint=getattr(model, "_checkpoint_fingerprint", ""),

@@ -60,6 +60,7 @@ def test_mtp_trainer_writes_runtime_loadable_checkpoint(tmp_path, monkeypatch):
     )
     hidden = mx.ones((1, 1, 4))
     embedding = mx.ones((8, 4))
+
     def output_projection(future_hidden):
         return future_hidden @ embedding.T
 

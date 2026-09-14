@@ -75,6 +75,11 @@ class LightningWhisperMLX():
             isinstance(assistant_model, str)
             and assistant_model in models
         ):
+            if "distil" in assistant_model:
+                raise ValueError(
+                    f"assistant model {assistant_model!r} uses an unsupported nested layout; "
+                    "pass a repository or local path with root-level weights"
+                )
             assistant_key = assistant_quant or "base"
             if assistant_key not in models[assistant_model]:
                 raise ValueError("assistant_quant is unavailable for assistant_model")

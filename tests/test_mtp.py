@@ -4,8 +4,10 @@ import pytest
 from lightning_whisper_mlx.mtp import (
     MTPCheckpointMetadata,
     MTPHead,
+    load_mtp_head,
     validate_checkpoint_metadata,
 )
+from training.train_mtp import MTPTrainer
 
 
 def test_mtp_head_returns_one_logit_matrix_per_future_horizon():
@@ -59,4 +61,41 @@ def test_mtp_checkpoint_metadata_rejects_incompatible_base():
             tokenizer_fingerprint="tokenizer-b",
             decoder_hidden_size=8,
             vocabulary_size=32,
+        )
+
+
+@pytest.mark.parametrize("damage", ["missing", "unexpected", "wrong_shape"])
+def test_mtp_checkpoint_rejects_incomplete_or_incompatible_weights(tmp_path, damage):
+    trainer = MTPTrainer(
+        hidden_size=8, vocabulary_size=32, horizons=2, learning_rate=0.01
+    )
+    checkpoint = tmp_path / "mtp"
+    trainer.save_checkpoint(
+        checkpoint,
+        base_model_repository="org/model",
+        base_model_revision="rev",
+        base_model_fingerprint="base",
+        tokenizer_fingerprint="tokenizer",
+        label_manifest_digest="labels",
+        dataset_split_digest="split",
+        training_commit="commit",
+    )
+    weights_path = str(checkpoint / "weights.npz")
+    weights = mx.load(weights_path)
+    name = next(iter(weights))
+    if damage == "missing":
+        weights.pop(name)
+    elif damage == "unexpected":
+        weights["unexpected.weight"] = mx.zeros((8,))
+    else:
+        weights[name] = mx.zeros((1,))
+    mx.savez(weights_path, **weights)
+
+    with pytest.raises(ValueError):
+        load_mtp_head(
+            str(checkpoint),
+            decoder_hidden_size=8,
+            vocabulary_size=32,
+            base_model_fingerprint="base",
+            tokenizer_fingerprint="tokenizer",
         )

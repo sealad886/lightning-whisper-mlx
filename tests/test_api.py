@@ -75,3 +75,42 @@ def test_transcription_rejects_assistant_with_different_mel_bins(monkeypatch):
             speculative_mode="assistant",
             assistant_model="local-assistant",
         )
+
+
+def test_distil_assistant_alias_rejected_before_download(monkeypatch):
+    from lightning_whisper_mlx import lightning
+
+    def unexpected_download(**kwargs):
+        pytest.fail("unsupported layout must not start a download")
+
+    monkeypatch.setattr(lightning, "hf_hub_download", unexpected_download)
+    with pytest.raises(ValueError, match="unsupported nested layout"):
+        LightningWhisperMLX(
+            model="base",
+            speculative_mode="assistant",
+            assistant_model="distil-small.en",
+            batch_size=1,
+        )
+
+
+@pytest.mark.parametrize("checkpoint_options", [{}, {"mtp_checkpoint": None}])
+def test_transcription_reports_missing_mtp_checkpoint(monkeypatch, checkpoint_options):
+    from types import SimpleNamespace
+    import mlx.core as mx
+    from lightning_whisper_mlx import transcribe
+
+    target = SimpleNamespace(
+        dims=SimpleNamespace(n_mels=80), is_multilingual=True, num_languages=99
+    )
+    monkeypatch.setattr(transcribe.ModelHolder, "get_model", lambda *args: target)
+    monkeypatch.setattr(
+        transcribe, "log_mel_spectrogram", lambda *args, **kwargs: mx.zeros((3000, 80))
+    )
+    with pytest.raises(ValueError, match="requires mtp_checkpoint"):
+        transcribe.transcribe_audio(
+            "unused.wav",
+            batch_size=1,
+            language="en",
+            speculative_mode="mtp",
+            **checkpoint_options,
+        )

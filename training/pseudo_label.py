@@ -56,7 +56,9 @@ def generate_pseudo_labels(
                 continue
             try:
                 label = teacher(record)
-                pending_labels.append({**record, **label, "audio_digest": digest})
+                pending_label = {**record, **label, "audio_digest": digest}
+                json.dumps(pending_label, sort_keys=True)
+                pending_labels.append(pending_label)
                 labeled_digests.add(digest)
                 counts["labeled"] += 1
             except Exception as error:  # record a failed ledger entry and continue

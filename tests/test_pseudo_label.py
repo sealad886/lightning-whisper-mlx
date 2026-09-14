@@ -57,3 +57,26 @@ def test_interrupted_labeling_flushes_progress_and_resumes_without_repeats(tmp_p
         for line in (tmp_path / "labels.jsonl").read_text().splitlines()
     ]
     assert [record["audio_digest"] for record in labels] == ["0", "2", "3", "4", "5"]
+
+
+def test_nonserializable_teacher_output_is_a_per_record_failure(tmp_path):
+    import json
+
+    records = [{"audio_digest": digest} for digest in ("a", "b", "c")]
+
+    def teacher(record):
+        return {"tokens": object() if record["audio_digest"] == "b" else [1, 2]}
+
+    counts = generate_pseudo_labels(records, teacher, tmp_path, flush_every=2)
+
+    assert counts == {"labeled": 2, "failed": 1, "skipped": 0}
+    labels = [
+        json.loads(line)
+        for line in (tmp_path / "labels.jsonl").read_text().splitlines()
+    ]
+    assert [record["audio_digest"] for record in labels] == ["a", "c"]
+    failures = [
+        json.loads(line)
+        for line in (tmp_path / "failures.jsonl").read_text().splitlines()
+    ]
+    assert [record["audio_digest"] for record in failures] == ["b"]

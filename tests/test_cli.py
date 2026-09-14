@@ -42,6 +42,7 @@ def test_empty_output_dir_is_stdout_sentinel():
     assert normalize_output_dir("") == STDOUT_OUTPUT
     assert normalize_output_dir("''") == STDOUT_OUTPUT
     assert normalize_output_dir('""') == STDOUT_OUTPUT
+    assert normalize_output_dir(normalize_output_dir("")) is STDOUT_OUTPUT
 
 
 def test_output_directory_preserves_relative_structure(tmp_path):

@@ -8,7 +8,6 @@ from typing import Callable, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_unflatten
 
 
 class MTPHead(nn.Module):
@@ -96,8 +95,7 @@ def load_mtp_head(
         vocabulary_size=vocabulary_size,
     )
     head = MTPHead(decoder_hidden_size, metadata.horizons)
-    weights = tree_unflatten(list(mx.load(str(path / "weights.npz")).items()))
-    head.update(weights)
+    head.load_weights(list(mx.load(str(path / "weights.npz")).items()), strict=True)
     mx.eval(head.parameters())
     return head, metadata
 

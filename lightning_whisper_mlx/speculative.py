@@ -29,7 +29,9 @@ class VerificationResult:
 class AssistantProposer:
     """Greedy assistant proposal generator with cache synchronization."""
 
-    def __init__(self, model, audio_features: mx.array, prefix: mx.array, lookahead: int):
+    def __init__(
+        self, model, audio_features: mx.array, prefix: mx.array, lookahead: int
+    ):
         from .decoding import Inference
 
         self.inference = Inference(model, initial_token_length=prefix.shape[-1])
@@ -165,9 +167,11 @@ class AssistantSpeculativeDecoder:
         )
         self.proposer = AssistantProposer(
             assistant_model,
-            assistant_audio_features
-            if assistant_audio_features is not None
-            else audio_features,
+            (
+                assistant_audio_features
+                if assistant_audio_features is not None
+                else audio_features
+            ),
             mx.array([list(prefix)]),
             lookahead,
         )
@@ -201,7 +205,9 @@ class AssistantSpeculativeDecoder:
 class MTPProposer:
     """Generate future-token proposals from the target decoder hidden state."""
 
-    def __init__(self, *, inference, next_logits, head, output_projection, lookahead: int):
+    def __init__(
+        self, *, inference, next_logits, head, output_projection, lookahead: int
+    ):
         self.inference = inference
         self.next_logits = next_logits
         self.head = head
@@ -209,7 +215,9 @@ class MTPProposer:
         self.lookahead = lookahead
 
     def propose(self, max_tokens: Optional[int] = None) -> List[int]:
-        width = self.lookahead if max_tokens is None else min(self.lookahead, max_tokens)
+        width = (
+            self.lookahead if max_tokens is None else min(self.lookahead, max_tokens)
+        )
         if width <= 0:
             return []
         first = int(mx.argmax(self.next_logits[:, -1], axis=-1)[0].item())
@@ -221,7 +229,7 @@ class MTPProposer:
         future_logits = self.head(
             self.inference.last_hidden[:, -1:], self.output_projection
         )[0, 0]
-        for logits in future_logits[:width - 1]:
+        for logits in future_logits[: width - 1]:
             proposals.append(int(mx.argmax(logits, axis=-1).item()))
         return proposals
 
@@ -266,7 +274,11 @@ class MTPSpeculativeDecoder:
         sum_logprob = 0.0
         while len(generated) < sample_len and self.verifier.remaining_tokens:
             remaining = sample_len - len(generated)
-            self.proposer.next_logits = self.verifier.next_logits
+            self.proposer.next_logits = _filtered_row(
+                self.verifier.next_logits[:, -1],
+                self.verifier.prefix,
+                self.verifier.logit_filters,
+            )[:, None, :]
             proposals = self.proposer.propose(
                 max_tokens=self.verifier.proposal_limit(remaining)
             )
@@ -299,6 +311,14 @@ def _as_row(logits: mx.array) -> mx.array:
     return logits[None, :] if logits.ndim == 1 else logits
 
 
+def _filtered_row(logits, history, filters):
+    row = _as_row(logits).astype(mx.float32)
+    token_history = mx.array([history])
+    for logit_filter in filters:
+        row = logit_filter.apply(row, token_history)
+    return row
+
+
 def verify_greedy_proposals(
     *,
     prefix: Sequence[int],
@@ -326,11 +346,7 @@ def verify_greedy_proposals(
     filters = tuple(logit_filters or ())
 
     for index, proposal in enumerate(proposals):
-        row = _as_row(logits[index]).astype(mx.float32)
-        filtered = row
-        token_history = mx.array([history])
-        for logit_filter in filters:
-            filtered = logit_filter.apply(filtered, token_history)
+        filtered = _filtered_row(logits[index], history, filters)
         target = int(mx.argmax(filtered, axis=-1)[0].item())
         logprobs = filtered - mx.logsumexp(filtered, axis=-1, keepdims=True)
         selected = target
@@ -355,11 +371,7 @@ def verify_greedy_proposals(
         and len(logits) > len(proposals)
         and (not generated or generated[-1] != eot)
     ):
-        row = _as_row(logits[len(proposals)]).astype(mx.float32)
-        filtered = row
-        token_history = mx.array([history])
-        for logit_filter in filters:
-            filtered = logit_filter.apply(filtered, token_history)
+        filtered = _filtered_row(logits[len(proposals)], history, filters)
         bonus = int(mx.argmax(filtered, axis=-1)[0].item())
         generated.append(bonus)
         bonus_tokens = 1
