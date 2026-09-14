@@ -67,6 +67,30 @@ Training manifests reference source cache files and never copy source audio.
 Pseudo-label output and MTP checkpoints are generated artifacts and should remain
 outside Git unless a small provenance record is explicitly requested.
 
+## Command-line transcription
+
+The `lightning-whisper-mlx` command accepts one file, multiple files, or directories:
+
+```bash
+lightning-whisper-mlx recording.mp3
+lightning-whisper-mlx one.wav two.m4a
+lightning-whisper-mlx recordings/ --recursive --output-dir transcripts/
+```
+
+Without `--output-dir`, each transcript is written beside its source as a `.txt`
+file. Use `--output-dir ''` (or `--output-dir '""'`) to print transcripts to
+stdout. A non-empty output directory preserves relative parent directories, so
+same-named files do not overwrite one another.
+Inputs in the same directory that share a stem (for example `clip.wav` and
+`clip.mp4`) would share a transcript path. The CLI reports those inputs as failures
+before transcription; rename them or use stdout. Other files still continue.
+
+Supported video files have their audio stream extracted through `ffmpeg` before
+transcription. Install `ffmpeg` separately and ensure it is on `PATH`.
+
+See the [benchmark runbook](docs/evaluation/decoding-benchmarks.md) for the local
+comparison command, deferred execution window, and remaining merge gates.
+
 #### Example
 
 ```python

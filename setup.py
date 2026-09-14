@@ -24,5 +24,10 @@ setup(
             'black',
             'flake8'
         ]
-    }
+    },
+    entry_points={
+        'console_scripts': [
+            'lightning-whisper-mlx=lightning_whisper_mlx.cli:main',
+        ],
+    },
 )
