@@ -157,10 +157,7 @@ class Inference:
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
 
-        logits, self.kv_cache, _, self.last_hidden = self.model.decoder(
-            tokens, audio_features, kv_cache=self.kv_cache
-        )
-        return logits.astype(mx.float32)
+        return self.forward_block(tokens, audio_features)
 
     def prefill(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
         """Run the initial prompt without reducing it to its final token."""

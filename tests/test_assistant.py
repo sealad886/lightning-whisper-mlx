@@ -52,3 +52,30 @@ def test_assistant_proposer_discards_all_unaccepted_proposals():
 
     assert len(proposals) == 2
     assert proposer.cache_length == 3
+
+
+def test_assistant_proposals_match_committed_history_across_rounds():
+    model = make_model()
+    audio_features = mx.random.normal((1, 3, 8))
+    history = [1, 2]
+    proposer = AssistantProposer(
+        model=model,
+        audio_features=audio_features,
+        prefix=mx.array([history]),
+        lookahead=2,
+    )
+
+    for round_index, accepted in enumerate((1, 0, 2, 1)):
+        fresh = AssistantProposer(
+            model=model,
+            audio_features=audio_features,
+            prefix=mx.array([history]),
+            lookahead=2,
+        )
+        proposals = proposer.propose()
+        assert proposals == fresh.propose()
+
+        committed = proposals[:accepted] + [7 + round_index]
+        proposer.synchronize(accepted=accepted, committed_tokens=committed)
+        history.extend(committed)
+        assert proposer.cache_length == len(history)

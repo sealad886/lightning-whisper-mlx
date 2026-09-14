@@ -41,11 +41,28 @@ def test_block_logits_match_sequential_logits():
         block.forward_block(tokens[:, 1:], audio_features),
     ]
 
-    expected = mx.concatenate(
-        [sequential_logits[0], *sequential_logits[1:]], axis=1
-    )
+    expected = mx.concatenate([sequential_logits[0], *sequential_logits[1:]], axis=1)
     actual = mx.concatenate(block_logits, axis=1)
     assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+
+
+def test_baseline_logits_match_full_history_across_decode_steps():
+    model = make_model()
+    audio_features = mx.random.normal((1, 3, 8))
+    tokens = mx.array([[1, 2, 3, 4]])
+    inference = Inference(model, initial_token_length=2)
+
+    for length in range(2, tokens.shape[-1] + 1):
+        history = tokens[:, :length]
+        actual = inference.logits(history, audio_features)
+        expected = model.logits(history, audio_features)
+        if length > 2:
+            expected = expected[:, -1:]
+
+        assert actual.dtype == mx.float32
+        assert actual.shape == expected.shape
+        assert inference.cache_length == length
+        assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
 
 
 def test_truncate_and_replay_matches_original_forward():

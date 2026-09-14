@@ -42,10 +42,16 @@ class AssistantProposer:
     def cache_length(self) -> int:
         return self.inference.cache_length
 
-    def propose(self) -> List[int]:
+    def propose(self, max_tokens: Optional[int] = None) -> List[int]:
         proposals: List[int] = []
         logits = self._next_logits[:, -1]
-        for _ in range(self.lookahead):
+        width = min(
+            self.lookahead,
+            self.inference.model.dims.n_text_ctx - self.cache_length,
+        )
+        if max_tokens is not None:
+            width = min(width, max_tokens)
+        for _ in range(width):
             token = int(mx.argmax(logits, axis=-1)[0].item())
             proposals.append(token)
             self._next_logits = self.inference.forward_one(
@@ -57,9 +63,12 @@ class AssistantProposer:
     def synchronize(self, accepted: int, committed_tokens: Sequence[int]):
         self.inference.truncate(self._prefix_cache_length + accepted)
         for token in committed_tokens[accepted:]:
+            if self.cache_length == self.inference.model.dims.n_text_ctx:
+                break
             self._next_logits = self.inference.forward_one(
                 mx.array([[token]]), self.audio_features
             )
+        self._prefix_cache_length = self.inference.cache_length
 
 
 class CachedGreedyVerifier:
@@ -86,16 +95,33 @@ class CachedGreedyVerifier:
     def cache_length(self) -> int:
         return self.inference.cache_length
 
-    def verify(self, proposals: Sequence[int]) -> VerificationResult:
-        if not proposals:
-            raise ValueError("at least one proposal is required")
+    @property
+    def remaining_tokens(self) -> int:
+        # A full cache can still predict one final token without replaying it.
+        return max(0, self.inference.model.dims.n_text_ctx - len(self.prefix) + 1)
+
+    def proposal_limit(self, max_tokens: int) -> int:
+        return max(0, min(max_tokens, self.remaining_tokens) - 1)
+
+    def verify(
+        self, proposals: Sequence[int], max_tokens: Optional[int] = None
+    ) -> VerificationResult:
+        budget = self.remaining_tokens
+        if max_tokens is not None:
+            budget = min(budget, max_tokens)
+        if budget <= 0:
+            raise ValueError("verification requires remaining token capacity")
+        proposals = list(proposals[: self.proposal_limit(budget)])
 
         committed_length = self.inference.cache_length
-        block_logits = self.inference.forward_block(
-            mx.array([list(proposals)]), self.audio_features
-        )
         target_logits = [self.next_logits[:, -1]]
-        target_logits.extend(block_logits[0, index] for index in range(len(proposals)))
+        if proposals:
+            block_logits = self.inference.forward_block(
+                mx.array([proposals]), self.audio_features
+            )
+            target_logits.extend(
+                block_logits[0, index] for index in range(len(proposals))
+            )
         result = verify_greedy_proposals(
             prefix=self.prefix,
             proposals=proposals,
@@ -105,7 +131,10 @@ class CachedGreedyVerifier:
         )
 
         self.inference.truncate(committed_length + result.accepted)
-        for token in result.tokens[result.accepted :]:
+        replay = result.tokens[result.accepted :]
+        if len(result.tokens) == budget:
+            replay = replay[:-1]
+        for token in replay:
             self.next_logits = self.inference.forward_one(
                 mx.array([[token]]), self.audio_features
             )
@@ -155,15 +184,17 @@ class AssistantSpeculativeDecoder:
     def decode(self, sample_len: int):
         generated: List[int] = []
         sum_logprob = 0.0
-        while len(generated) < sample_len:
-            proposals = self.proposer.propose()
-            result = self.verifier.verify(proposals)
-            self.proposer.synchronize(result.accepted, result.tokens)
+        while len(generated) < sample_len and self.verifier.remaining_tokens:
             remaining = sample_len - len(generated)
+            proposals = self.proposer.propose(
+                max_tokens=self.verifier.proposal_limit(remaining)
+            )
+            result = self.verifier.verify(proposals, max_tokens=remaining)
             generated.extend(result.tokens[:remaining])
             sum_logprob += sum(result.token_logprobs[:remaining])
-            if self.eot in result.tokens:
+            if self.eot in result.tokens or len(generated) == sample_len:
                 break
+            self.proposer.synchronize(result.accepted, result.tokens)
         return generated[:sample_len], float(sum_logprob)
 
 
@@ -177,17 +208,20 @@ class MTPProposer:
         self.embedding_weight = embedding_weight
         self.lookahead = lookahead
 
-    def propose(self) -> List[int]:
+    def propose(self, max_tokens: Optional[int] = None) -> List[int]:
+        width = self.lookahead if max_tokens is None else min(self.lookahead, max_tokens)
+        if width <= 0:
+            return []
         first = int(mx.argmax(self.next_logits[:, -1], axis=-1)[0].item())
         proposals = [first]
-        if self.lookahead == 1:
+        if width == 1:
             return proposals
         if self.inference.last_hidden is None:
             raise RuntimeError("MTP proposal requires decoder hidden states")
         future_logits = self.head(
             self.inference.last_hidden[:, -1:], self.embedding_weight
         )[0, 0]
-        for logits in future_logits[:self.lookahead - 1]:
+        for logits in future_logits[:width - 1]:
             proposals.append(int(mx.argmax(logits, axis=-1).item()))
         return proposals
 
@@ -230,10 +264,13 @@ class MTPSpeculativeDecoder:
     def decode(self, sample_len: int):
         generated: List[int] = []
         sum_logprob = 0.0
-        while len(generated) < sample_len:
-            self.proposer.next_logits = self.verifier.next_logits
-            result = self.verifier.verify(self.proposer.propose())
+        while len(generated) < sample_len and self.verifier.remaining_tokens:
             remaining = sample_len - len(generated)
+            self.proposer.next_logits = self.verifier.next_logits
+            proposals = self.proposer.propose(
+                max_tokens=self.verifier.proposal_limit(remaining)
+            )
+            result = self.verifier.verify(proposals, max_tokens=remaining)
             generated.extend(result.tokens[:remaining])
             sum_logprob += sum(result.token_logprobs[:remaining])
             if self.eot in result.tokens:
