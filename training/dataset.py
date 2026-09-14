@@ -22,8 +22,10 @@ def iter_teacher_examples(
         if not label or label.get("failure_status"):
             continue
         tokens = list(label.get("tokens", []))
-        for start in range(max(0, len(tokens) - horizons)):
-            target = tokens[start + 1 : start + horizons + 1]
+        # The target decoder supplies the immediate next token. MTP head zero
+        # predicts the token after that from the final prefix hidden state.
+        for start in range(max(0, len(tokens) - horizons - 1)):
+            target = tokens[start + 2 : start + horizons + 2]
             if len(target) == horizons:
                 yield {
                     "audio_digest": record["audio_digest"],

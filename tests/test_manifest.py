@@ -52,3 +52,31 @@ def test_split_records_never_separates_duplicate_digests():
         by_digest.setdefault(record["audio_digest"], set()).add(record["split"])
 
     assert all(len(splits) == 1 for splits in by_digest.values())
+
+
+def test_split_records_balances_independent_records_reproducibly():
+    records = [
+        {"record_id": str(i), "speaker_id": str(i), "audio_digest": str(i)}
+        for i in range(100)
+    ]
+
+    split = split_records(records, seed=7)
+
+    assert {name: sum(record["split"] == name for record in split)
+            for name in ("train", "validation", "test")} == {
+        "train": 80, "validation": 10, "test": 10,
+    }
+    assert split == split_records(records, seed=7)
+    assert all("split" not in record for record in records)
+
+
+def test_split_records_keeps_transitive_speaker_and_digest_groups_together():
+    records = [
+        {"record_id": "a", "speaker_id": "one", "audio_digest": "first"},
+        {"record_id": "b", "speaker_id": "one", "audio_digest": "shared"},
+        {"record_id": "c", "speaker_id": "two", "audio_digest": "shared"},
+    ]
+
+    split = split_records(records, seed=7)
+
+    assert len({record["split"] for record in split}) == 1
