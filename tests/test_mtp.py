@@ -1,5 +1,6 @@
 import mlx.core as mx
 import pytest
+import mlx.nn as nn
 
 from lightning_whisper_mlx.mtp import (
     MTPCheckpointMetadata,
@@ -67,7 +68,11 @@ def test_mtp_checkpoint_metadata_rejects_incompatible_base():
 @pytest.mark.parametrize("damage", ["missing", "unexpected", "wrong_shape"])
 def test_mtp_checkpoint_rejects_incomplete_or_incompatible_weights(tmp_path, damage):
     trainer = MTPTrainer(
-        hidden_size=8, vocabulary_size=32, horizons=2, learning_rate=0.01
+        hidden_size=8,
+        vocabulary_size=32,
+        horizons=2,
+        learning_rate=0.01,
+        output_projection=nn.Embedding(32, 8).as_linear,
     )
     checkpoint = tmp_path / "mtp"
     trainer.save_checkpoint(
@@ -98,4 +103,53 @@ def test_mtp_checkpoint_rejects_incomplete_or_incompatible_weights(tmp_path, dam
             vocabulary_size=32,
             base_model_fingerprint="base",
             tokenizer_fingerprint="tokenizer",
+        )
+
+
+def test_tokenizer_fingerprint_identifies_full_vocabulary_and_segmentation():
+    from types import SimpleNamespace
+    import tiktoken
+    from lightning_whisper_mlx.mtp import fingerprint_tokenizer
+
+    def tokenizer(ranks, pattern=r"[\s\S]"):
+        return SimpleNamespace(
+            encoding=tiktoken.Encoding(
+                name="fingerprint-test",
+                pat_str=pattern,
+                mergeable_ranks=ranks,
+                special_tokens={"<|endoftext|>": 2},
+            )
+        )
+
+    first = tokenizer({b"a": 0, b"b": 1})
+    swapped = tokenizer({b"a": 1, b"b": 0})
+    different_pattern = tokenizer({b"a": 0, b"b": 1}, r".+")
+    assert fingerprint_tokenizer(first) != fingerprint_tokenizer(swapped)
+    assert fingerprint_tokenizer(first) != fingerprint_tokenizer(different_pattern)
+
+
+def test_checkpoint_schema_one_requires_regeneration_and_retraining():
+    metadata = MTPCheckpointMetadata(
+        base_model_repository="local",
+        base_model_revision="rev",
+        base_model_fingerprint="base",
+        decoder_hidden_size=8,
+        vocabulary_size=32,
+        tokenizer_fingerprint="tokenizer",
+        horizons=2,
+        weight_dtype="float32",
+        training_config={},
+        label_manifest_digest="labels",
+        dataset_split_digest="split",
+        training_commit="commit",
+        validation_metrics={},
+        schema_version=1,
+    )
+    with pytest.raises(ValueError, match="regenerate labels and retrain"):
+        validate_checkpoint_metadata(
+            metadata,
+            base_model_fingerprint="base",
+            tokenizer_fingerprint="tokenizer",
+            decoder_hidden_size=8,
+            vocabulary_size=32,
         )

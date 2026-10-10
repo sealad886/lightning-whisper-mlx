@@ -27,7 +27,9 @@ def _metadata_records(path: Path) -> Iterable[Dict[str, object]]:
             yield dict(record)
 
 
-def _record_from_metadata(shard: Path, metadata: Dict[str, object]) -> Dict[str, object]:
+def _record_from_metadata(
+    shard: Path, metadata: Dict[str, object], max_samples: int = 480000
+) -> Dict[str, object]:
     shard = shard.resolve()
     audio_path = (shard / Path(str(metadata["audio_path"]))).resolve()
     try:
@@ -45,6 +47,13 @@ def _record_from_metadata(shard: Path, metadata: Dict[str, object]) -> Dict[str,
         sample_count = int(array.size)
         if array.ndim != 1 or array.dtype.kind != "f":
             status = "invalid_shape_or_dtype"
+        elif not 0 < sample_count <= max_samples:
+            status = "invalid_clip_length"
+        elif not all(
+            np.isfinite(array[start : start + 262144]).all()
+            for start in range(0, sample_count, 262144)
+        ):
+            status = "nonfinite_audio"
     except (OSError, ValueError):
         shape = []
         dtype = "unknown"
@@ -52,8 +61,8 @@ def _record_from_metadata(shard: Path, metadata: Dict[str, object]) -> Dict[str,
         status = "unreadable"
 
     sample_rate = int(metadata.get("sample_rate", 16000))
-    if sample_rate <= 0:
-        status = "unknown_sample_rate"
+    if sample_rate != 16000:
+        status = "unsupported_sample_rate"
     audio_digest = _digest(audio_path) if status != "unreadable" else ""
     return {
         "record_id": record_id,
@@ -73,7 +82,9 @@ def _record_from_metadata(shard: Path, metadata: Dict[str, object]) -> Dict[str,
     }
 
 
-def split_records(records: List[Dict[str, object]], seed: int = 0) -> List[Dict[str, object]]:
+def split_records(
+    records: List[Dict[str, object]], seed: int = 0
+) -> List[Dict[str, object]]:
     groups: Dict[str, set] = {}
     for index, record in enumerate(records):
         speaker = record.get("speaker_id")
@@ -104,22 +115,35 @@ def split_records(records: List[Dict[str, object]], seed: int = 0) -> List[Dict[
     names = ["train", "validation", "test"]
     assignments = {}
     for index in order:
-        split_index = min(range(3), key=lambda candidate: totals[candidate] - targets[candidate])
+        split_index = min(
+            range(3), key=lambda candidate: totals[candidate] - targets[candidate]
+        )
         for record_index in components[index]:
             assignments[record_index] = names[split_index]
         totals[split_index] += len(components[index])
 
-    return [dict(record, split=assignments[index]) for index, record in enumerate(records)]
+    return [
+        dict(record, split=assignments[index]) for index, record in enumerate(records)
+    ]
 
 
-def build_manifest(cache_root: Path, output: Path, seed: int = 0) -> int:
+def build_manifest(
+    cache_root: Path, output: Path, seed: int = 0, *, max_samples: int = 480000
+) -> int:
+    if max_samples < 1:
+        raise ValueError("max_samples must be positive")
     records = []
     for metadata_path in sorted((cache_root / "speech").glob("shard_*/__paths__.json")):
         shard = metadata_path.parent
         for metadata in _metadata_records(metadata_path):
-            record = _record_from_metadata(shard, metadata)
-            if record["validation_status"] == "valid":
-                records.append(record)
+            record = _record_from_metadata(shard, metadata, max_samples)
+            if record["validation_status"] != "valid":
+                raise ValueError(
+                    f"invalid source audio {shard / str(metadata['audio_path'])}: "
+                    f"{record['validation_status']}; require finite mono floating "
+                    f"NPY, 16000 Hz, 1..{max_samples} samples"
+                )
+            records.append(record)
     records = split_records(records, seed=seed)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")

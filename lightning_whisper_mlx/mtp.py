@@ -46,7 +46,7 @@ class MTPCheckpointMetadata:
     dataset_split_digest: str
     training_commit: str
     validation_metrics: Dict[str, float]
-    schema_version: int = 1
+    schema_version: int = 2
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -64,8 +64,11 @@ def validate_checkpoint_metadata(
     decoder_hidden_size: int,
     vocabulary_size: int,
 ):
-    if metadata.schema_version != 1:
-        raise ValueError("unsupported MTP checkpoint schema version")
+    if metadata.schema_version != 2:
+        raise ValueError(
+            "unsupported MTP checkpoint schema version; regenerate labels and "
+            "retrain with the full tokenizer fingerprint (schema 2)"
+        )
     if metadata.base_model_fingerprint != base_model_fingerprint:
         raise ValueError("MTP checkpoint base model fingerprint is incompatible")
     if metadata.tokenizer_fingerprint != tokenizer_fingerprint:
@@ -101,13 +104,22 @@ def load_mtp_head(
 
 
 def fingerprint_tokenizer(tokenizer) -> str:
-    values = {
-        "eot": tokenizer.eot,
-        "sot": tokenizer.sot,
-        "sot_prev": tokenizer.sot_prev,
-        "timestamp_begin": tokenizer.timestamp_begin,
-        "transcribe": tokenizer.transcribe,
-        "translate": tokenizer.translate,
-        "no_timestamps": tokenizer.no_timestamps,
+    """Identify the complete tiktoken mapping and text segmentation contract.
+
+    Language/task belong to a labeling run, not vocabulary compatibility.
+    tiktoken exposes token bytes and single-token IDs publicly; its regex pattern
+    is retained on Encoding as _pat_str (the constructor's pat_str).
+    """
+    encoding = tokenizer.encoding
+    digest = hashlib.sha256()
+    digest.update(encoding._pat_str.encode())
+    for token in encoding.token_byte_values():
+        digest.update(len(token).to_bytes(4, "big"))
+        digest.update(token)
+        digest.update(encoding.encode_single_token(token).to_bytes(4, "big"))
+    specials = {
+        token: encoding.encode_single_token(token)
+        for token in sorted(encoding.special_tokens_set)
     }
-    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+    digest.update(json.dumps(specials, sort_keys=True).encode())
+    return digest.hexdigest()

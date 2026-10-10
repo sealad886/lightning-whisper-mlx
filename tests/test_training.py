@@ -1,5 +1,6 @@
 import mlx.core as mx
 import pytest
+import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from lightning_whisper_mlx.mtp import load_mtp_head
@@ -9,10 +10,14 @@ from training.train_mtp import MTPTrainer
 
 def test_mtp_trainer_updates_only_head_and_returns_loss():
     trainer = MTPTrainer(
-        hidden_size=4, vocabulary_size=8, horizons=2, learning_rate=0.01
+        hidden_size=4,
+        vocabulary_size=8,
+        horizons=2,
+        learning_rate=0.01,
+        output_projection=nn.Embedding(8, 4).as_linear,
     )
     hidden = mx.random.normal((1, 2, 4))
-    embedding = mx.random.normal((8, 4))
+    embedding = trainer.output_projection.__self__.weight
     targets = mx.array([[[1, 2], [3, 4]]])
     before = {
         name: mx.array(value) for name, value in tree_flatten(trainer.head.parameters())
@@ -20,7 +25,7 @@ def test_mtp_trainer_updates_only_head_and_returns_loss():
     embedding_before = mx.array(embedding)
     mx.eval(before, embedding_before)
 
-    loss = trainer.train_step(hidden, embedding, targets)
+    loss = trainer.train_step(hidden, targets)
 
     assert isinstance(loss, float)
     assert loss >= 0.0
@@ -33,7 +38,11 @@ def test_mtp_trainer_updates_only_head_and_returns_loss():
 
 def test_mtp_trainer_writes_runtime_loadable_checkpoint(tmp_path, monkeypatch):
     trainer = MTPTrainer(
-        hidden_size=4, vocabulary_size=8, horizons=2, learning_rate=0.01
+        hidden_size=4,
+        vocabulary_size=8,
+        horizons=2,
+        learning_rate=0.01,
+        output_projection=nn.Embedding(8, 4).as_linear,
     )
     checkpoint = tmp_path / "mtp"
 
@@ -59,10 +68,8 @@ def test_mtp_trainer_writes_runtime_loadable_checkpoint(tmp_path, monkeypatch):
         tokenizer_fingerprint="tokenizer",
     )
     hidden = mx.ones((1, 1, 4))
-    embedding = mx.ones((8, 4))
 
-    def output_projection(future_hidden):
-        return future_hidden @ embedding.T
+    output_projection = trainer.output_projection
 
     assert mx.array_equal(
         loaded(hidden, output_projection), trainer.head(hidden, output_projection)

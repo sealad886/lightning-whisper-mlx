@@ -8,7 +8,9 @@ from training.dataset import iter_teacher_examples
 def test_teacher_examples_align_with_future_proposal_horizons(tmp_path):
     labels = tmp_path / "labels.jsonl"
     tokens = [1, 2, 3, 4, 5]
-    labels.write_text(json.dumps({"audio_digest": "a", "tokens": tokens}) + "\n")
+    labels.write_text(
+        json.dumps({"audio_digest": "a", "tokens": tokens, "prefix": [1]}) + "\n"
+    )
     manifest = [{"audio_digest": "a", "split": "train"}]
 
     examples = list(iter_teacher_examples(manifest, labels, horizons=2))
@@ -28,8 +30,8 @@ def test_teacher_examples_skip_incomplete_horizons_and_non_training_labels(tmp_p
         "\n".join(
             json.dumps(record)
             for record in [
-                {"audio_digest": "short", "tokens": [1, 2, 3]},
-                {"audio_digest": "held_out", "tokens": [1, 2, 3, 4]},
+                {"audio_digest": "short", "tokens": [1, 2, 3], "prefix": [1]},
+                {"audio_digest": "held_out", "tokens": [1, 2, 3, 4], "prefix": [1]},
                 {
                     "audio_digest": "failed",
                     "tokens": [1, 2, 3, 4],
@@ -54,3 +56,22 @@ def test_teacher_examples_reject_nonpositive_horizons_before_reading_labels(
 ):
     with pytest.raises(ValueError, match="horizons must be at least 1"):
         list(iter_teacher_examples([], tmp_path / "missing.jsonl", horizons=horizons))
+
+
+def test_validation_windows_are_disjoint_and_begin_at_complete_prefix(tmp_path):
+    labels = tmp_path / "labels.jsonl"
+    rows = [
+        {"audio_digest": digest, "prefix": [1, 2], "tokens": [1, 2, 3, 4, 5, 6]}
+        for digest in ("training", "heldout")
+    ]
+    labels.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    manifest = [
+        {"audio_digest": "training", "split": "train"},
+        {"audio_digest": "heldout", "split": "validation"},
+    ]
+    train = list(iter_teacher_examples(manifest, labels, 2))
+    validation = list(iter_teacher_examples(manifest, labels, 2, split="validation"))
+    assert {row["audio_digest"] for row in train} == {"training"}
+    assert {row["audio_digest"] for row in validation} == {"heldout"}
+    assert validation[0]["prefix"] == [1, 2]
+    assert validation[0]["targets"] == [4, 5]
