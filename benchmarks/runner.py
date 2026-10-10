@@ -63,6 +63,8 @@ class BenchmarkResult:
     output: Any = None
     token_count: Optional[int] = None
     outputs: tuple[Any, ...] = ()
+    sample_order: tuple[Mapping[str, int], ...] = ()
+    sample_metrics: tuple[Mapping[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -132,58 +134,83 @@ def run_benchmark(
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> BenchmarkResult:
     """Run one case; warmups execute but never enter timing statistics."""
-    if warmups < 0:
-        raise ValueError("warmups must be nonnegative")
-    if repetitions < 1:
-        raise ValueError("repetitions must be positive")
-
-    for _ in range(warmups):
-        runner(case)
-
-    durations = []
-    output = None
-    token_count = None
-    outputs = []
-    for _ in range(repetitions):
-        start = time.perf_counter()
-        value = runner(case)
-        durations.append(time.perf_counter() - start)
-        output, token_count = _normalize_output(value)
-        outputs.append(deepcopy(output))
-
-    return BenchmarkResult(
-        case=case,
-        durations_seconds=tuple(durations),
-        repetitions=repetitions,
-        median_seconds=median(durations),
-        min_seconds=min(durations),
-        max_seconds=max(durations),
-        metadata={**(metadata or {}), **environment_metadata()},
-        output=output,
-        token_count=token_count,
-        outputs=tuple(outputs),
-    )
+    config = BenchmarkConfig(cases=(case,), warmups=warmups, repetitions=repetitions)
+    return BenchmarkSuite(config).run(runner, metadata=metadata)[0]
 
 
 class BenchmarkSuite:
     def __init__(self, config: BenchmarkConfig = BenchmarkConfig()):
         self.config = config
+        self.execution_order: list[dict[str, Any]] = []
 
     def run(
         self,
         runner: Callable[[BenchmarkCase], Any],
         *,
         metadata: Optional[Mapping[str, Any]] = None,
+        before_sample: Optional[Callable[[], None]] = None,
+        after_sample: Optional[Callable[[], Mapping[str, Any]]] = None,
     ) -> list[BenchmarkResult]:
+        """Interleave cases, rotating their starting position each round.
+
+        Optional resource measurement hooks run outside the timed interval.
+        Runners must synchronize their asynchronous work before returning.
+        """
+        self.execution_order = []
+        provenance = {**(metadata or {}), **environment_metadata()}
+        count = len(self.config.cases)
+        durations = [[] for _ in self.config.cases]
+        outputs = [[] for _ in self.config.cases]
+        token_counts = [None for _ in self.config.cases]
+        sample_orders = [[] for _ in self.config.cases]
+        metrics = [[] for _ in self.config.cases]
+        for phase, rounds in (
+            ("warmup", self.config.warmups),
+            ("timed", self.config.repetitions),
+        ):
+            for round_index in range(rounds):
+                for position in range(count):
+                    case_index = (round_index + position) % count
+                    case = self.config.cases[case_index]
+                    order = {
+                        "round_index": round_index,
+                        "position": position,
+                        "case_index": case_index,
+                        "execution_index": len(self.execution_order),
+                    }
+                    self.execution_order.append({"phase": phase, **order})
+                    if phase == "warmup":
+                        runner(case)
+                        continue
+                    if before_sample is not None:
+                        before_sample()
+                    start = time.perf_counter()
+                    value = runner(case)
+                    duration = time.perf_counter() - start
+                    measured = after_sample() if after_sample is not None else {}
+                    normalized, token_count = _normalize_output(value)
+                    durations[case_index].append(duration)
+                    outputs[case_index].append(deepcopy(normalized))
+                    token_counts[case_index] = token_count
+                    sample_orders[case_index].append(order)
+                    metrics[case_index].append(deepcopy(measured))
+
         return [
-            run_benchmark(
-                runner,
-                case,
-                warmups=self.config.warmups,
+            BenchmarkResult(
+                case=case,
+                durations_seconds=tuple(durations[index]),
                 repetitions=self.config.repetitions,
-                metadata=metadata,
+                median_seconds=median(durations[index]),
+                min_seconds=min(durations[index]),
+                max_seconds=max(durations[index]),
+                metadata=provenance,
+                output=deepcopy(outputs[index][-1]),
+                token_count=token_counts[index],
+                outputs=tuple(outputs[index]),
+                sample_order=tuple(sample_orders[index]),
+                sample_metrics=tuple(metrics[index]),
             )
-            for case in self.config.cases
+            for index, case in enumerate(self.config.cases)
         ]
 
     def to_dict(self, results: Sequence[BenchmarkResult]) -> dict[str, Any]:
@@ -191,6 +218,8 @@ class BenchmarkSuite:
             "config": {
                 "warmups": self.config.warmups,
                 "repetitions": self.config.repetitions,
+                "execution_policy": "interleaved-rotating-start",
             },
+            "execution_order": deepcopy(self.execution_order),
             "results": [result.to_dict() for result in results],
         }

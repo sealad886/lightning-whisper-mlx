@@ -5,9 +5,48 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from .runner import BenchmarkCase, BenchmarkConfig, BenchmarkSuite
+
+EXACT_FIELDS = ("tokens", "text", "language")
+SCORE_FIELDS = ("avg_logprob", "no_speech_prob")
+SCORE_ABSOLUTE_TOLERANCE = 1e-5
+SCORE_RELATIVE_TOLERANCE = 1e-4
+
+
+def exact_outputs_match(reference, output) -> bool:
+    return len(reference) == len(output) and all(
+        all(
+            field in expected and field in actual and expected[field] == actual[field]
+            for field in EXACT_FIELDS
+        )
+        for expected, actual in zip(reference, output)
+    )
+
+
+def decision_scores_match(reference, output) -> bool:
+    """Allow a small float32 reduction budget, but reject missing/nonfinite scores."""
+    if len(reference) != len(output):
+        return False
+    for expected, actual in zip(reference, output):
+        for field in SCORE_FIELDS:
+            left, right = expected.get(field), actual.get(field)
+            if not isinstance(left, (int, float)) or not isinstance(
+                right, (int, float)
+            ):
+                return False
+            if not (math.isfinite(left) and math.isfinite(right)):
+                return False
+            if not math.isclose(
+                left,
+                right,
+                rel_tol=SCORE_RELATIVE_TOLERANCE,
+                abs_tol=SCORE_ABSOLUTE_TOLERANCE,
+            ):
+                return False
+    return True
 
 
 def file_digest(path: Path) -> str:
@@ -19,24 +58,43 @@ def file_digest(path: Path) -> str:
 
 
 def assess_results(results) -> dict:
-    """Require every repetition to match the baseline's tokens and text."""
+    """Assess exact outputs, decision scores, and speed as separate gates."""
     baseline = results[0]
     reference = baseline.outputs[0]
-    baseline_stable = all(value == reference for value in baseline.outputs)
+    baseline_stable = all(
+        exact_outputs_match(reference, value) for value in baseline.outputs
+    )
+    baseline_scores_stable = all(
+        decision_scores_match(reference, value) for value in baseline.outputs
+    )
     comparisons = []
     for result in results[1:]:
-        exact = baseline_stable and all(value == reference for value in result.outputs)
+        exact = baseline_stable and all(
+            exact_outputs_match(reference, value) for value in result.outputs
+        )
+        scores_match = baseline_scores_stable and all(
+            decision_scores_match(reference, value) for value in result.outputs
+        )
         speedup = baseline.median_seconds / result.median_seconds
         comparisons.append(
             {
                 "mode": result.case.mode,
                 "lookahead": result.case.lookahead,
                 "exact_match": exact,
+                "decision_scores_match": scores_match,
                 "median_speedup": speedup,
                 "meets_speed_threshold": speedup >= 1.2,
             }
         )
-    return {"baseline_stable": baseline_stable, "comparisons": comparisons}
+    return {
+        "baseline_stable": baseline_stable,
+        "baseline_scores_stable": baseline_scores_stable,
+        "score_tolerance": {
+            "absolute": SCORE_ABSOLUTE_TOLERANCE,
+            "relative": SCORE_RELATIVE_TOLERANCE,
+        },
+        "comparisons": comparisons,
+    }
 
 
 def build_parser():
@@ -170,27 +228,61 @@ def main(argv=None):
                     "tokens": result.tokens,
                     "text": result.text,
                     "language": result.language,
+                    "avg_logprob": float(result.avg_logprob),
+                    "no_speech_prob": float(result.no_speech_prob),
                 }
             )
         mx.synchronize()
         return outputs
 
-    mx.reset_peak_memory()
+    active_before = 0
+
+    def before_sample():
+        nonlocal active_before
+        mx.synchronize()
+        active_before = mx.get_active_memory()
+        mx.reset_peak_memory()
+
+    def after_sample():
+        active_after = mx.get_active_memory()
+        return {
+            # Resetting a high-water mark does not unload any selected artifacts.
+            "peak_active_memory_bytes": max(
+                active_before, active_after, mx.get_peak_memory()
+            ),
+            "active_memory_before_bytes": active_before,
+            "active_memory_after_bytes": active_after,
+            "cached_memory_after_bytes": mx.get_cache_memory(),
+        }
+
     suite = BenchmarkSuite(config)
     results = suite.run(
         runner,
+        before_sample=before_sample,
+        after_sample=after_sample,
         metadata={
             "artifacts": artifacts,
             "fixtures": fixtures,
             "language": args.language,
             "dtype": "float16",
             "scope": "encoder-plus-decoder; prepared mel; sequential single-row clips",
+            "memory_scope": (
+                "MLX active allocation peak per timed invocation; "
+                "all selected artifacts resident; allocator cache reported separately; "
+                "not process RSS or isolated mode residency"
+            ),
             "tokenizer_fingerprint": fingerprint_tokenizer(tokenizer),
         },
     )
     payload = suite.to_dict(results)
     payload["assessment"] = assess_results(results)
-    payload["peak_memory_bytes"] = mx.get_peak_memory()
+    for record, result in zip(payload["results"], results):
+        record["peak_memory_bytes"] = max(
+            sample["peak_active_memory_bytes"] for sample in result.sample_metrics
+        )
+    payload["peak_memory_bytes"] = max(
+        record["peak_memory_bytes"] for record in payload["results"]
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x") as stream:
         stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -199,7 +291,11 @@ def main(argv=None):
         0
         if (
             assessment["baseline_stable"]
-            and all(item["exact_match"] for item in assessment["comparisons"])
+            and assessment["baseline_scores_stable"]
+            and all(
+                item["exact_match"] and item["decision_scores_match"]
+                for item in assessment["comparisons"]
+            )
         )
         else 1
     )

@@ -22,6 +22,14 @@ Each result records actual git revision, Python/platform/MLX versions, repetitio
 count, per-run durations, median/min/max, and runner output.
 `outputs` retains an independent snapshot for every timed repetition; `output`
 is the final repetition. Runners must finish asynchronous work before returning.
+The suite runs one invocation of every case per round, rotating the starting case
+each round. Every case occupies each timing position once per complete cycle of
+rounds; an incomplete final cycle differs by at most one sample per position.
+Results retain configured case order, while `execution_order` records warmup/timed
+phase, zero-based round, position, case index, and execution index. Each result's
+`sample_order` and `sample_metrics` align with its durations and output snapshots.
+The public `run_benchmark` function uses the same machinery for one case. Optional
+`before_sample`/`after_sample` hooks measure resources outside the timed interval.
 Environment fields cannot be replaced by caller metadata. `git_dirty` exposes
 working-tree changes; a commit hash alone does not identify a dirty run.
 
@@ -102,9 +110,10 @@ At the agreed window:
    Use fresh output paths: existing files are rejected rather than overwritten.
 
 5. Repeat independent runs for lookahead 1, 2, and 4. Reverse the lookahead run
-   order on the next pass and repeat the baseline to expose thermal drift. The
-   runner always places baseline first within a comparison, so compare independent
-   passes before attributing a small speed change to the decoder. Treat each
+   order on the next pass to expose thermal drift. Modes now interleave within
+   each round and rotate timing positions; this reduces ordering bias but cannot
+   remove thermal drift or contention. Compare independent passes before
+   attributing a small speed change to the decoder. Treat each
    target/quantization/language/fixture set as a separate bucket. Batch size is one;
    speculative batching is explicitly unsupported and excluded from claims.
 
@@ -114,19 +123,35 @@ The local runner preloads models and prepares mel features outside the timer.
 Each timed invocation includes target encoder and decoder for all supplied clips,
 plus assistant encoder/decoder when selected. It synchronizes MLX before returning.
 It excludes downloads, model loading, audio decoding, and mel preparation. Model
-loading is not a speedup result. Peak memory is process-wide over the suite with
-all selected artifacts resident, not incremental memory attributable to each mode.
+loading is not a speedup result. Each timed invocation resets and reads the MLX
+allocation high-water mark outside timing. `sample_metrics` records active memory
+before/after, peak active allocation, and allocator cache after that invocation.
+The peak includes at least the active allocations present before measurement;
+resetting the counter does not unload artifacts. All selected target/assistant/MTP
+artifacts remain resident for every mode. These are per-invocation MLX allocation
+measurements, not isolated mode residency, incremental accelerator cost, or process
+RSS. Top-level `peak_memory_bytes` is the maximum timed-sample active peak; warmup
+and model-loading peaks are excluded. Cached buffers are reported separately.
 
-Every repetition stores full token IDs, text, and language per clip. Timestamp
+Every repetition stores full token IDs, text, language, average log probability,
+and no-speech probability per clip. Timestamp
 tokens are part of exact-token comparison. Baseline repetitions must agree with
-each other; every accelerated repetition must match that baseline. Exit 1 means
-an exactness failure; exit 0 alone does not establish a speedup or merge approval.
-The JSON separately records the 1.2x median speed threshold for each comparison.
+each other; every accelerated repetition must match that baseline. Token/text/
+language equality and decision-score parity are separate gates. Missing or
+nonfinite scores fail parity. Finite scores use `math.isclose` with absolute
+tolerance `1e-5` and relative tolerance `1e-4`, recorded in the assessment. This is
+a small float32 reduction/accumulation budget, allowing numeric noise without
+demanding bitwise equality; it is a provisional measurement policy, not proof
+of equivalence for real models. Even scores inside tolerance can cross a
+transcription retry/silence threshold. Full-transcription behavior, especially
+near thresholds, must still be qualified separately. Exit 1 means output or
+decision-score parity failed; exit 0 alone does not establish a speedup or merge
+approval. The JSON separately records the 1.2x median speed threshold.
 
 | Gate | Required evidence | Current status |
 | --- | --- | --- |
 | Synthetic correctness | All native regressions pass on final source | 100 passed locally on 2026-09-14; rerun for final reviewed source if changed |
-| Lossless clip decode | Every baseline and candidate repetition matches tokens/text/language | Pending real assets/window |
+| Lossless clip decode | Every baseline and candidate repetition matches tokens/text/language and passes decision-score tolerance | Pending real assets/window |
 | Performance | At least 1.2x median speedup in each promoted bucket, reproduced across independent passes | Unmeasured |
 | Stability | No OOM/crash; stable baseline durations and uncontended runs | Unmeasured |
 | Full transcription | Long-form API/CLI run; identical text and segment timestamps, silence handling and fallback | Pending; clip benchmark does not cover this |

@@ -64,7 +64,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     suite = BenchmarkSuite(config)
     results = suite.run(runner)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(suite.to_dict(results), indent=2, sort_keys=True) + "\n")
+    args.output.write_text(
+        json.dumps(suite.to_dict(results), indent=2, sort_keys=True) + "\n"
+    )
     return 0
 
 
