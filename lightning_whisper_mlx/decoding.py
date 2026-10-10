@@ -2,7 +2,16 @@
 
 import zlib
 from dataclasses import dataclass, field, replace
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -18,6 +27,9 @@ from .speculative import (
 )
 from .tokenizer import Tokenizer, get_tokenizer
 
+if TYPE_CHECKING:
+    from .whisper import Whisper
+
 
 def compression_ratio(text) -> float:
     text_bytes = text.encode("utf-8")
@@ -26,7 +38,7 @@ def compression_ratio(text) -> float:
 
 def detect_language(
     model: "Whisper", mel: mx.array, tokenizer: Tokenizer = None
-) -> Tuple[mx.array, List[dict]]:
+) -> Tuple[mx.array, Union[Dict[str, float], List[Dict[str, float]]]]:
     """
     Detect the spoken language in the audio, and return them as list of strings, along with the ids
     of the most probable language tokens and the probability distribution over all language tokens.
