@@ -56,7 +56,7 @@ and held-out audio fixture are provided.
 
 ## Local comparison runbook
 
-Status (2026-09-14): **not run; merge blocked**. Other MLX workloads are active.
+Status (2026-10-10): **not run; merge blocked**. Other MLX workloads are active.
 Andrew selects the uncontended window and held-out assets. No background benchmark
 or automatic merge is scheduled. Do not stop competing jobs to obtain a slot.
 
@@ -150,7 +150,7 @@ approval. The JSON separately records the 1.2x median speed threshold.
 
 | Gate | Required evidence | Current status |
 | --- | --- | --- |
-| Synthetic correctness | All native regressions pass on final source | 100 passed locally on 2026-09-14; rerun for final reviewed source if changed |
+| Synthetic correctness | All native regressions pass on final source | 169 passed locally on 2026-10-10; synthetic correctness, no real-model qualification |
 | Lossless clip decode | Every baseline and candidate repetition matches tokens/text/language and passes decision-score tolerance | Pending real assets/window |
 | Performance | At least 1.2x median speedup in each promoted bucket, reproduced across independent passes | Unmeasured |
 | Stability | No OOM/crash; stable baseline durations and uncontended runs | Unmeasured |

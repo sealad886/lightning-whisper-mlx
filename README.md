@@ -1,10 +1,12 @@
 # Lightning Whisper MLX
 
-An incredibly fast implementation of Whisper optimized for Apple Silicon.
+Whisper transcription for Apple Silicon, with batching, quantized models, and optional speculative decoding.
 
 ![Whisper Decoding Speed](./speed_image.png)
 
-10x faster than Whisper CPP, 4x faster than current MLX Whisper implementation.
+The chart records historical results. Current-source speed, accuracy, and memory
+comparisons against Whisper CPP and MLX Whisper remain unqualified until
+reproducible benchmarks return data.
 
 ## Features
 
@@ -38,7 +40,7 @@ Quantization
 Speculative decoding is opt-in and supports temperature-zero greedy decoding.
 `none` remains the default. Assistant mode currently requires `batch_size=1` and
 an assistant model with a compatible tokenizer vocabulary; MTP mode requires a
-versioned checkpoint produced by the training tools.
+versioned checkpoint produced by the local MTP training workflow.
 
 ```python
 from lightning_whisper_mlx import LightningWhisperMLX
@@ -107,7 +109,17 @@ print(text)
 
 ## Notes
 
-- The default batch_size is `12`, higher is better for throughput but you might run into memory issues. The heuristic is it really depends on the size of the model. If you are running the smaller models, then higher batch size, larger models, lower batch size. Also keep in mind your unified memory!
+- The default `batch_size` is `12`. Conditioned long-form transcription decodes
+  sequentially to preserve previous-text context. Use
+  `condition_on_previous_text=False` to batch independent windows. Larger batches
+  increase memory use; their throughput benefit requires measurement.
+- Dense, 4-bit, and 8-bit target variants have distinct model directories. Existing
+  downloaded files remain untouched; quantized variants download into their new
+  named directories when explicitly selected.
+- `segments` contains dictionaries with `start`/`end` in seconds, text, token IDs,
+  and decoder scores. `word_timestamps=True` additionally produces aligned words.
+- [MTP training](docs/training/mtp-training.md) documents the local-only pipeline.
+  Completing the workflow does not establish trained-head quality or speed.
 
 ## Credits
 
