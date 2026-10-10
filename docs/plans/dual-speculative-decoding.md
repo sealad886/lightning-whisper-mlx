@@ -56,14 +56,18 @@ Milestones:
 1. Complete: transcription/decoder contracts and regression proofs.
 2. Complete: model/cache identity and failure cleanup.
 3. Complete: MTP workflow, provenance and synthetic train/export/reload proof.
-4. Active: benchmark runbook, documentation and current-head PR review.
+4. Complete: benchmark runbook, documentation and independent source review.
+   Real benchmark execution and integration remain deferred.
 
 Design decisions: conditioned long-form decoding is sequential; independent
 windows may batch with conditioning disabled. Generated artifacts never modify
 source caches. Legacy ledgers require an explicit backup/migration with supplied
 provenance, and incompatible heads require retraining. No compatibility adapters.
 
-Review sources: independent Codex review and configured Copilot on PR #1.
+Required review source: independent Codex. The holistic review is clean at
+`7469767`. On 2026-10-10 Andrew removed Copilot as a required gate after its quota
+failures; those attempts remain historical failures, not clean reviews. Codex
+remains retired under the review-loop policy.
 The integrated native suite passed 169 tests on 2026-10-10. Synthetic workflow
 execution and source review do not establish real-audio quality or acceleration.
 Merge and automatic merge remain blocked pending real benchmark data.

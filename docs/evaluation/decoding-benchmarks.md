@@ -156,7 +156,7 @@ approval. The JSON separately records the 1.2x median speed threshold.
 | Stability | No OOM/crash; stable baseline durations and uncontended runs | Unmeasured |
 | Full transcription | Long-form API/CLI run; identical text and segment timestamps, silence handling and fallback | Pending; clip benchmark does not cover this |
 | MTP qualification | Correctly aligned training, held-out loss/acceptance, compatible checkpoint, parity/speed results | Pending trained artifact |
-| Review/integration | Clean active review sources, required CI/human approvals, no conflicts, final-head check | Pending PR review |
+| Review/integration | Clean required review sources, required CI/human approvals, no conflicts, final-head check | Independent Codex clean at `7469767`; Copilot removed as a required gate by Andrew on 2026-10-10; recheck integration requirements after benchmark qualification |
 
 Real benchmark data is a minimum merge gate, not sufficient by itself. A speed
 failure keeps that mode experimental and blocks its promotion; never replace a
