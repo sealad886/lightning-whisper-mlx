@@ -420,14 +420,12 @@ class ApplyTimestampRules(LogitFilter):
                 else:  # cannot be normal text tokens
                     mask[k, : self.tokenizer.eot] = -np.inf
 
-            timestamps = [
-                i for i, v in enumerate(seq) if v > self.tokenizer.timestamp_begin
-            ]
+            timestamps = [v for v in seq if v >= self.tokenizer.timestamp_begin]
             if len(timestamps) > 0:
                 # timestamps shouldn't decrease; forbid timestamp tokens smaller than the last
                 # also force each segment to have a nonzero length, to prevent infinite looping
                 last_timestamp = timestamps[-1]
-                if not last_timestamp or penultimate_was_timestamp:
+                if not last_was_timestamp or penultimate_was_timestamp:
                     last_timestamp += 1
                 mask[k, self.tokenizer.timestamp_begin : last_timestamp] = -np.inf
 
@@ -443,6 +441,7 @@ class ApplyTimestampRules(LogitFilter):
                 mask[:, last_allowed + 1 :] = -np.inf
 
         # if sum of probability over timestamps is above any other token, sample timestamp
+        logits = logits + mx.array(mask, logits.dtype)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         for k in range(tokens.shape[0]):
             timestamp_logprob = logprobs[k, self.tokenizer.timestamp_begin :].logsumexp(
@@ -450,9 +449,17 @@ class ApplyTimestampRules(LogitFilter):
             )
             max_text_token_logprob = logprobs[k, : self.tokenizer.timestamp_begin].max()
             if timestamp_logprob > max_text_token_logprob:
-                mask[k, : self.tokenizer.timestamp_begin] = -np.inf
+                logits = mx.where(
+                    (mx.arange(logits.shape[0])[:, None] == k)
+                    & (
+                        mx.arange(logits.shape[1])[None, :]
+                        < self.tokenizer.timestamp_begin
+                    ),
+                    -mx.inf,
+                    logits,
+                )
 
-        return logits + mx.array(mask, logits.dtype)
+        return logits
 
 
 class DecodingTask:
@@ -514,7 +521,7 @@ class DecodingTask:
         if not options.without_timestamps:
             precision = CHUNK_LENGTH / model.dims.n_audio_ctx  # usually 0.02 seconds
             max_initial_timestamp_index = None
-            if options.max_initial_timestamp:
+            if options.max_initial_timestamp is not None:
                 max_initial_timestamp_index = round(
                     self.options.max_initial_timestamp / precision
                 )
@@ -777,13 +784,8 @@ class DecodingTask:
         # repeat tokens by the group size, for beam search or best-of-n sampling
         tokens = mx.array(tokens)
         if self.n_group > 1:
-            tokens = tokens[:, None, :]
-            tokens = mx.broadcast_to(
-                tokens, [n_audio, self.n_group, len(self.initial_tokens)]
-            )
-            tokens = tokens.reshape(
-                tokens, (n_audio * self.n_group, len(self.initial_tokens))
-            )
+            tokens = mx.repeat(tokens, self.n_group, axis=0)
+            audio_features = mx.repeat(audio_features, self.n_group, axis=0)
 
         # call the main sampling loop
         tokens, sum_logprobs, no_speech_probs = self._main_loop(

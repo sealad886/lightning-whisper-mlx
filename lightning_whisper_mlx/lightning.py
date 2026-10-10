@@ -107,11 +107,10 @@ class LightningWhisperMLX():
         else:
             repo_id = models[model]['base']
 
-        if quant and "distil" in model:
-            if quant == "4bit":
-                self.name += "-4-bit"
-            else:
-                self.name += "-8-bit"
+        if quant:
+            # Distilled repositories use their existing nested artifact names.
+            suffix = f"-{quant[0]}-bit" if "distil" in model else f"-{quant}"
+            self.name += suffix
 
         if "distil" in model:
             filename1 = f"./mlx_models/{self.name}/weights.npz"

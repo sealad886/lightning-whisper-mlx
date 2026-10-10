@@ -153,22 +153,24 @@ def log_mel_spectrogram(
     """
     device = mx.default_device()
     mx.set_default_device(mx.cpu)
-    if isinstance(audio, str):
-        audio = load_audio(audio)
-    elif not isinstance(audio, mx.array):
-        audio = mx.array(audio)
+    try:
+        if isinstance(audio, str):
+            audio = load_audio(audio)
+        elif not isinstance(audio, mx.array):
+            audio = mx.array(audio)
 
-    if padding > 0:
-        audio = mx.pad(audio, (0, padding))
-    window = hanning(N_FFT)
-    freqs = stft(audio, window, nperseg=N_FFT, noverlap=HOP_LENGTH)
-    magnitudes = freqs[:-1, :].abs().square()
+        if padding > 0:
+            audio = mx.pad(audio, (0, padding))
+        window = hanning(N_FFT)
+        freqs = stft(audio, window, nperseg=N_FFT, noverlap=HOP_LENGTH)
+        magnitudes = freqs[:-1, :].abs().square()
 
-    filters = mel_filters(n_mels)
-    mel_spec = magnitudes @ filters.T
+        filters = mel_filters(n_mels)
+        mel_spec = magnitudes @ filters.T
 
-    log_spec = mx.maximum(mel_spec, 1e-10).log10()
-    log_spec = mx.maximum(log_spec, log_spec.max() - 8.0)
-    log_spec = (log_spec + 4.0) / 4.0
-    mx.set_default_device(device)
-    return log_spec
+        log_spec = mx.maximum(mel_spec, 1e-10).log10()
+        log_spec = mx.maximum(log_spec, log_spec.max() - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        return log_spec
+    finally:
+        mx.set_default_device(device)
