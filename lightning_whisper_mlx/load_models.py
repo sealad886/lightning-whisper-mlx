@@ -1,6 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 import json
+import hashlib
 from pathlib import Path
 
 import mlx.core as mx
@@ -9,6 +10,18 @@ from huggingface_hub import snapshot_download
 from mlx.utils import tree_unflatten
 
 from . import whisper
+
+
+def model_artifact_identity(path_or_hf_repo):
+    """Identify a local artifact cheaply for cache invalidation after replacement."""
+    path = Path(path_or_hf_repo)
+    if not path.exists():
+        return ("repository", str(path_or_hf_repo))
+    files = []
+    for name in ("config.json", "weights.npz"):
+        info = (path / name).stat()
+        files.append((name, info.st_size, info.st_mtime_ns, info.st_ino))
+    return ("local", str(path.resolve()), tuple(files))
 
 
 def load_model(
@@ -27,7 +40,12 @@ def load_model(
     model_args = whisper.ModelDimensions(**config)
 
     weights = mx.load(str(model_path / "weights.npz"))
-    weights = tree_unflatten(list(weights.items()))
+    # Loading replaces constructed parameters, so checkpoint precision must be
+    # converted explicitly. Keep packed quantized weights and other integers.
+    weights = {
+        name: value.astype(dtype) if mx.issubdtype(value.dtype, mx.floating) else value
+        for name, value in weights.items()
+    }
 
     model = whisper.Whisper(model_args, dtype)
 
@@ -38,6 +56,12 @@ def load_model(
         )
         nn.quantize(model, **quantization, class_predicate=class_predicate)
 
-    model.update(weights)
+    model.update(tree_unflatten(list(weights.items())))
     mx.eval(model.parameters())
+    digest = hashlib.sha256()
+    for filename in ("config.json", "weights.npz"):
+        with (model_path / filename).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    model._checkpoint_fingerprint = digest.hexdigest()
     return model
