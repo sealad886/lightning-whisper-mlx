@@ -30,13 +30,20 @@ class AssistantProposer:
     """Greedy assistant proposal generator with cache synchronization."""
 
     def __init__(
-        self, model, audio_features: mx.array, prefix: mx.array, lookahead: int
+        self,
+        model,
+        audio_features: mx.array,
+        prefix: mx.array,
+        lookahead: int,
+        logit_filters: Optional[Sequence[object]] = None,
     ):
         from .decoding import Inference
 
         self.inference = Inference(model, initial_token_length=prefix.shape[-1])
         self.audio_features = audio_features
         self.lookahead = lookahead
+        self.prefix = prefix
+        self.logit_filters = tuple(logit_filters or ())
         self._next_logits = self.inference.prefill(prefix, audio_features)
         self._prefix_cache_length = self.inference.cache_length
 
@@ -45,7 +52,8 @@ class AssistantProposer:
         return self.inference.cache_length
 
     def propose(self, max_tokens: Optional[int] = None) -> List[int]:
-        proposals: List[int] = []
+        proposals = []
+        history = self.prefix
         logits = self._next_logits[:, -1]
         width = min(
             self.lookahead,
@@ -54,13 +62,15 @@ class AssistantProposer:
         if max_tokens is not None:
             width = min(width, max_tokens)
         for _ in range(width):
-            token = int(mx.argmax(logits, axis=-1)[0].item())
+            filtered = _filtered_row(logits, history, self.logit_filters)
+            token = mx.argmax(filtered, axis=-1)
             proposals.append(token)
+            history = mx.concatenate([history, token[:, None]], axis=-1)
             self._next_logits = self.inference.forward_one(
-                mx.array([[token]]), self.audio_features
+                token[:, None], self.audio_features
             )
             logits = self._next_logits[:, -1]
-        return proposals
+        return mx.concatenate(proposals).tolist() if proposals else []
 
     def synchronize(self, accepted: int, committed_tokens: Sequence[int]):
         self.inference.truncate(self._prefix_cache_length + accepted)
@@ -71,6 +81,9 @@ class AssistantProposer:
                 mx.array([[token]]), self.audio_features
             )
         self._prefix_cache_length = self.inference.cache_length
+        self.prefix = mx.concatenate(
+            [self.prefix, mx.array([list(committed_tokens)])], axis=-1
+        )
 
 
 class CachedGreedyVerifier:
@@ -174,6 +187,7 @@ class AssistantSpeculativeDecoder:
             ),
             mx.array([list(prefix)]),
             lookahead,
+            logit_filters,
         )
         self.verifier = CachedGreedyVerifier(
             inference=target_inference,
@@ -313,7 +327,7 @@ def _as_row(logits: mx.array) -> mx.array:
 
 def _filtered_row(logits, history, filters):
     row = _as_row(logits).astype(mx.float32)
-    token_history = mx.array([history])
+    token_history = history if isinstance(history, mx.array) else mx.array([history])
     for logit_filter in filters:
         row = logit_filter.apply(row, token_history)
     return row
@@ -337,18 +351,31 @@ def verify_greedy_proposals(
     if len(logits) < len(proposals):
         raise ValueError("target_logits must cover every proposal")
 
+    # Every row is conditioned on the proposal prefix. Rows after the first
+    # rejection are discarded, so they never define committed history.
+    filters = tuple(logit_filters or ())
+    targets, scores = [], []
     history = list(prefix)
+    for index, row in enumerate(logits[: len(proposals) + 1]):
+        filtered = _filtered_row(row, history, filters)
+        targets.append(mx.argmax(filtered, axis=-1))
+        scores.append(mx.max(filtered, axis=-1) - mx.logsumexp(filtered, axis=-1))
+        if index < len(proposals):
+            history.append(proposals[index])
+    target_array = mx.concatenate(targets)
+    score_array = mx.concatenate(scores)
+    mx.eval(target_array, score_array)
+    target_values = target_array.tolist()
+    score_values = score_array.tolist()
+
     generated: List[int] = []
     accepted = 0
     rejected = 0
     sum_logprob = 0.0
     token_logprobs: List[float] = []
-    filters = tuple(logit_filters or ())
 
     for index, proposal in enumerate(proposals):
-        filtered = _filtered_row(logits[index], history, filters)
-        target = int(mx.argmax(filtered, axis=-1)[0].item())
-        logprobs = filtered - mx.logsumexp(filtered, axis=-1, keepdims=True)
+        target = target_values[index]
         selected = target
         if proposal == target:
             accepted += 1
@@ -356,8 +383,7 @@ def verify_greedy_proposals(
         else:
             rejected += 1
         generated.append(selected)
-        history.append(selected)
-        token_logprob = float(logprobs[0, selected].item())
+        token_logprob = score_values[index]
         token_logprobs.append(token_logprob)
         sum_logprob += token_logprob
         if selected == eot:
@@ -371,12 +397,10 @@ def verify_greedy_proposals(
         and len(logits) > len(proposals)
         and (not generated or generated[-1] != eot)
     ):
-        filtered = _filtered_row(logits[len(proposals)], history, filters)
-        bonus = int(mx.argmax(filtered, axis=-1)[0].item())
+        bonus = target_values[len(proposals)]
         generated.append(bonus)
         bonus_tokens = 1
-        logprobs = filtered - mx.logsumexp(filtered, axis=-1, keepdims=True)
-        token_logprob = float(logprobs[0, bonus].item())
+        token_logprob = score_values[len(proposals)]
         token_logprobs.append(token_logprob)
         sum_logprob += token_logprob
 

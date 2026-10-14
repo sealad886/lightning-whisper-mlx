@@ -1,6 +1,7 @@
 import mlx.core as mx
 
 from lightning_whisper_mlx.speculative import AssistantProposer
+from lightning_whisper_mlx.decoding import SuppressTokens
 from lightning_whisper_mlx.whisper import ModelDimensions, Whisper
 
 
@@ -79,3 +80,18 @@ def test_assistant_proposals_match_committed_history_across_rounds():
         proposer.synchronize(accepted=accepted, committed_tokens=committed)
         history.extend(committed)
         assert proposer.cache_length == len(history)
+
+
+def test_assistant_drafts_respect_target_token_suppression():
+    model = make_model()
+    audio = mx.random.normal((1, 3, 8))
+    prefix = mx.array([[1, 2]])
+    unfiltered = int(mx.argmax(model.logits(prefix, audio)[0, -1]).item())
+    proposer = AssistantProposer(
+        model=model, audio_features=audio, prefix=prefix, lookahead=3,
+        logit_filters=[SuppressTokens([unfiltered], model.dims.n_vocab)],
+    )
+    proposals = proposer.propose()
+    assert unfiltered not in proposals
+    proposer.synchronize(accepted=1, committed_tokens=[proposals[0], 7])
+    assert unfiltered not in proposer.propose()

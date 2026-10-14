@@ -1,4 +1,5 @@
 import mlx.core as mx
+import pytest
 
 from lightning_whisper_mlx.decoding import Inference
 from lightning_whisper_mlx.whisper import ModelDimensions, Whisper
@@ -80,3 +81,32 @@ def test_truncate_and_replay_matches_original_forward():
     replayed = inference.forward_one(tokens[:, 1:2], audio_features)
 
     assert mx.allclose(replayed, original, atol=1e-5, rtol=1e-5).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
+def test_cached_proposal_logits_and_cache_preserve_sequential_arithmetic(dtype):
+    """Block verification must retain target values before host acceptance."""
+    mx.random.seed(8)
+    model = make_model()
+    model.set_dtype(dtype)
+    audio = mx.random.normal((1, 3, 8)).astype(dtype)
+    prefix = mx.array([[1, 2]])
+    proposals = mx.array([[3, 4, 5]])
+    sequential = Inference(model, initial_token_length=2)
+    sequential.prefill(prefix, audio)
+    expected = []
+    for index in range(3):
+        row = sequential.forward_one(proposals[:, index : index + 1], audio)
+        mx.eval(row, sequential.kv_cache)
+        expected.append(row)
+
+    queued = Inference(model, initial_token_length=2)
+    queued.prefill(prefix, audio)
+    actual = queued.forward_block(proposals, audio)
+    assert mx.array_equal(actual, mx.concatenate(expected, axis=1)).item()
+    for expected_layer, actual_layer in zip(sequential.kv_cache, queued.kv_cache):
+        for expected_pair, actual_pair in zip(expected_layer, actual_layer):
+            assert all(
+                mx.array_equal(a, b).item()
+                for a, b in zip(expected_pair, actual_pair)
+            )

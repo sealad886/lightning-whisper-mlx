@@ -45,6 +45,19 @@ def test_zero_initial_timestamp_is_enforced():
     assert int(mx.argmax(rule.apply(raw, mx.array([[9]])), axis=-1)[0].item()) == 20
 
 
+def test_timestamp_rules_apply_independently_to_each_history_in_batch():
+    rule = ApplyTimestampRules(
+        SimpleNamespace(timestamp_begin=20, eot=10, no_timestamps=19), 1, None
+    )
+    history = mx.array([[9, 20, 1, 27], [9, 20, 27, 2]])
+    raw = mx.zeros((2, 32))
+    filtered = rule.apply(raw, history)
+    assert np.all(np.isneginf(np.array(filtered)[0, :10]))
+    assert np.isfinite(filtered[0, 27].item())
+    assert np.all(np.isneginf(np.array(filtered)[1, 20:28]))
+    assert np.isfinite(filtered[1, 28].item())
+
+
 def test_best_of_groups_keep_each_audio_and_choose_best_candidate(monkeypatch):
     model = SimpleNamespace(
         dims=SimpleNamespace(

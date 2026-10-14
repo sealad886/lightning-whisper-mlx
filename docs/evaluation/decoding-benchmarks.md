@@ -56,9 +56,36 @@ and held-out audio fixture are provided.
 
 ## Local comparison runbook
 
-Status (2026-10-10): **not run; merge blocked**. Other MLX workloads are active.
-Andrew selects the uncontended window and held-out assets. No background benchmark
-or automatic merge is scheduled. Do not stop competing jobs to obtain a slot.
+Status (2026-10-14): **54 saved real-model comparisons assessed; merge blocked**.
+The October 10–11 results identify clean source revision
+`e476c7dcc37e5b0689d007ebd94dd3a1c693e96e`, MLX 0.32.2, Python 3.12.15,
+macOS 27.2 arm64, float16 base target and tiny assistant, and English fixtures.
+Each comparison contains two warmups and seven timed repetitions per mode.
+The matrix covers nine fixture buckets, lookahead 1/2/4, and two passes.
+
+| Measured gate | Result |
+| --- | --- |
+| Stable baseline tokens and decision scores | 54/54 comparisons |
+| Exact candidate tokens/text/language, including timestamp tokens | 50/54 comparisons |
+| Candidate decision-score parity | 28/54 comparisons |
+| At least 1.2x median speedup | 0/54 comparisons |
+| Observed baseline/candidate median-time ratio | 0.549–0.744; candidate takes 1.34–1.82x baseline time |
+
+Lookahead 1 passes exactness and score parity in all 18 comparisons, but is slower
+than baseline. Lookahead 2 and 4 both change text and timestamp tokens for the
+near-30-second speech/music fixture in both passes. All 26 score-parity failures
+involve average log probability; no-speech probability passes throughout. These
+results disqualify the measured assistant buckets from promotion. They do not
+qualify MTP, other model pairs, quantization, languages, or full transcription.
+Saved files do not establish contemporaneous GPU contention or thermal conditions;
+they are retained failure evidence, not proof of uncontended performance.
+
+Raw audio, transcripts, model artifacts, and result JSON remain outside Git.
+Reassess the unchanged raw outputs when resuming; the prepared matrix manifest
+still says "not executed" and records an earlier source revision. Actual result
+metadata controls the measured revision and result status. No background benchmark
+or automatic merge is scheduled. Andrew selects any new uncontended window;
+do not stop competing jobs to obtain a slot.
 
 `benchmarks.compare_decoding` is the concrete local runner. It requires local
 `config.json`/`weights.npz` target and assistant folders, and optionally an MTP
@@ -150,13 +177,13 @@ approval. The JSON separately records the 1.2x median speed threshold.
 
 | Gate | Required evidence | Current status |
 | --- | --- | --- |
-| Synthetic correctness | All native regressions pass on final source | 169 passed locally on 2026-10-10; synthetic correctness, no real-model qualification |
-| Lossless clip decode | Every baseline and candidate repetition matches tokens/text/language and passes decision-score tolerance | Pending real assets/window |
-| Performance | At least 1.2x median speedup in each promoted bucket, reproduced across independent passes | Unmeasured |
-| Stability | No OOM/crash; stable baseline durations and uncontended runs | Unmeasured |
+| Synthetic correctness | All native regressions pass on final source | 169 passed on `e476c7d` on 2026-10-14; synthetic correctness, no real-model qualification |
+| Lossless clip decode | Every baseline and candidate repetition matches tokens/text/language and passes decision-score tolerance | Failed: exactness 50/54; scores 28/54 |
+| Performance | At least 1.2x median speedup in each promoted bucket, reproduced across independent passes | Failed: 0/54; measured ratios 0.549–0.744 |
+| Stability | No OOM/crash; stable baseline durations and uncontended runs | 54 complete saved comparisons with stable baseline outputs; contemporaneous contention/thermal evidence not established |
 | Full transcription | Long-form API/CLI run; identical text and segment timestamps, silence handling and fallback | Pending; clip benchmark does not cover this |
 | MTP qualification | Correctly aligned training, held-out loss/acceptance, compatible checkpoint, parity/speed results | Pending trained artifact |
-| Review/integration | Clean required review sources, required CI/human approvals, no conflicts, final-head check | Independent Codex clean at `7469767`; Copilot removed as a required gate by Andrew on 2026-10-10; recheck integration requirements after benchmark qualification |
+| Review/integration | Clean required review sources, required CI/human approvals, no conflicts, final-head check | Independent Codex clean at `e476c7d` in cumulative round 7/10; Copilot removed as a required gate by Andrew on 2026-10-10; recheck integration requirements after benchmark qualification |
 
 Real benchmark data is a minimum merge gate, not sufficient by itself. A speed
 failure keeps that mode experimental and blocks its promotion; never replace a

@@ -70,4 +70,48 @@ failures; those attempts remain historical failures, not clean reviews. Codex
 remains retired under the review-loop policy.
 The integrated native suite passed 169 tests on 2026-10-10. Synthetic workflow
 execution and source review do not establish real-audio quality or acceleration.
-Merge and automatic merge remain blocked pending real benchmark data.
+The final independent Codex review also covered `e476c7d` in cumulative round 7/10.
+The source remains retired under the review-loop policy; its static clean result
+does not clear native model acceptance gates.
+
+## Consolidation checkpoint (2026-10-14)
+
+Verified integration destination: `sealad886/lightning-whisper-mlx`, `origin/main`
+at `5a4d978bcac88af22e612a3e58dfe07dbb3294ba`. Existing PR #1 contains all 23
+outstanding commits at `e476c7dcc37e5b0689d007ebd94dd3a1c693e96e`; no additional
+committed work exists on `mtp-speculative-speed-up`. Both configured remotes
+advertise the same default tip. One primary worktree, no stashes, and no staged,
+unstaged, or untracked source changes were present at discovery. Local environments,
+build products, caches, and externally stored benchmark assets are preserved.
+
+The native suite passed all 169 tests on the measured source. Assessment of all
+54 saved real-model comparisons found exact output parity in 50/54, decision-score
+parity in 28/54, and the required speedup in 0/54. The four exactness failures alter
+speech/music text and timestamp tokens at lookahead 2/4 across both passes.
+See [measured results and limitations](../evaluation/decoding-benchmarks.md).
+
+The initial head remains blocked by failed real-model parity and performance, with full
+transcription and trained MTP qualification still outstanding. Preserve PR #1
+and its source branch. Andrew expanded consolidation scope on 2026-10-14 to
+implement and benchmark decoder redesign. Do not weaken parity tolerance, promote
+a failed bucket, or infer runtime acceptance from synthetic tests.
+
+Redesign acceptance and sequence:
+
+1. Preserve ordinary target arithmetic and cache values in queued verification;
+   cover float16/float32, rejection, EOT, and context limits with native regressions.
+2. Apply shared logit filters to assistant drafts and keep timestamp decisions and
+   block scoring on the device, with batch and suppression regression coverage.
+3. Run all 54 local fixture comparisons against a clean source checkpoint, keeping
+   old results and raw artifacts outside Git. Record exactness, decision scores,
+   timing, memory, source identity, and environmental limitations independently.
+4. Qualify full transcription separately. Retain explicit experimental modes and
+   block promotion whenever the repeated 1.2x speed requirement is unmet.
+5. Reconcile review coverage and integration gates before any merge or cleanup.
+
+Initial diagnostic: queued float16 verification restored exact tokens/text on the
+previously failing near-30-second speech/music fixture, with average-logprob drift
+about 2.2e-8. Draft filtering reduced verification rounds from 26 to 22. Single
+profiles still ran slower than ordinary target decoding; these observations are
+diagnostics, not full-matrix qualification or a speedup claim. Isolated float32
+and fused-attention experiments did not establish a speedup and were not adopted.

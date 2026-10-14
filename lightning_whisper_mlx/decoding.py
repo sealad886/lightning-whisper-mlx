@@ -184,7 +184,21 @@ class Inference:
         return self.forward_block(tokens, audio_features)
 
     def forward_block(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
-        """Decode a token block and append its self-attention cache."""
+        """Queue cached tokens with the same arithmetic as sequential decoding.
+
+        Multi-row fp16 matmuls produce different logits/cache values from the
+        single-row target path. Queue single-token graphs without intermediate
+        evaluation so proposal verification preserves the target's arithmetic.
+        Initial prompt prefill remains one causal decoder call.
+        """
+        if self.kv_cache is not None and tokens.shape[-1] > 1:
+            return mx.concatenate(
+                [
+                    self.forward_one(tokens[:, index : index + 1], audio_features)
+                    for index in range(tokens.shape[-1])
+                ],
+                axis=1,
+            )
         logits, self.kv_cache, _, self.last_hidden = self.model.decoder(
             tokens, audio_features, kv_cache=self.kv_cache, return_hidden=True
         )
@@ -410,68 +424,76 @@ class ApplyTimestampRules(LogitFilter):
         self.max_initial_timestamp_index = max_initial_timestamp_index
 
     def apply(self, logits: mx.array, tokens: mx.array) -> mx.array:
-        mask = np.zeros(logits.shape, np.float32)
-        # suppress <|notimestamps|> which is handled by without_timestamps
+        # Keep history rules and probability decisions on the device. Reading
+        # history or timestamp mass on the host serializes every draft/target row.
+        token_ids = mx.arange(logits.shape[-1])[None, :]
+        forbidden = mx.zeros(logits.shape, dtype=mx.bool_)
         if self.tokenizer.no_timestamps is not None:
-            mask[:, self.tokenizer.no_timestamps] = -np.inf
+            forbidden = forbidden | (token_ids == self.tokenizer.no_timestamps)
 
-        # timestamps have to appear in pairs, except directly before EOT; mask logits accordingly
-        for k in range(tokens.shape[0]):
-            sampled_tokens = tokens[k, self.sample_begin :]
-            seq = sampled_tokens.tolist()
-            last_was_timestamp = (
-                len(seq) >= 1 and seq[-1] >= self.tokenizer.timestamp_begin
-            )
+        sampled = tokens[:, self.sample_begin :]
+        length = sampled.shape[-1]
+        if length:
+            is_timestamp = sampled >= self.tokenizer.timestamp_begin
+            last_was_timestamp = is_timestamp[:, -1:]
             penultimate_was_timestamp = (
-                len(seq) < 2 or seq[-2] >= self.tokenizer.timestamp_begin
+                is_timestamp[:, -2:-1]
+                if length >= 2
+                else mx.ones((tokens.shape[0], 1), dtype=mx.bool_)
             )
-
-            if last_was_timestamp:
-                if penultimate_was_timestamp:  # has to be non-timestamp
-                    mask[k, self.tokenizer.timestamp_begin :] = -np.inf
-                else:  # cannot be normal text tokens
-                    mask[k, : self.tokenizer.eot] = -np.inf
-
-            timestamps = [v for v in seq if v >= self.tokenizer.timestamp_begin]
-            if len(timestamps) > 0:
-                # timestamps shouldn't decrease; forbid timestamp tokens smaller than the last
-                # also force each segment to have a nonzero length, to prevent infinite looping
-                last_timestamp = timestamps[-1]
-                if not last_was_timestamp or penultimate_was_timestamp:
-                    last_timestamp += 1
-                mask[k, self.tokenizer.timestamp_begin : last_timestamp] = -np.inf
+            forbidden = forbidden | (
+                last_was_timestamp
+                & penultimate_was_timestamp
+                & (token_ids >= self.tokenizer.timestamp_begin)
+            ) | (
+                last_was_timestamp
+                & ~penultimate_was_timestamp
+                & (token_ids < self.tokenizer.eot)
+            )
+            # Select the last timestamp by position, including histories supplied
+            # by callers that do not already obey monotonicity.
+            positions = mx.arange(length)[None, :]
+            last_position = mx.max(
+                mx.where(is_timestamp, positions, -1), axis=-1, keepdims=True
+            )
+            last_timestamp = mx.take_along_axis(
+                sampled, mx.maximum(last_position, 0), axis=-1
+            )
+            lower_bound = last_timestamp + (
+                ~last_was_timestamp | penultimate_was_timestamp
+            )
+            forbidden = forbidden | (
+                (last_position >= 0)
+                & (token_ids >= self.tokenizer.timestamp_begin)
+                & (token_ids < lower_bound)
+            )
 
         if tokens.shape[1] == self.sample_begin:
             # suppress generating non-timestamp tokens at the beginning
-            mask[:, : self.tokenizer.timestamp_begin] = -np.inf
+            forbidden = forbidden | (token_ids < self.tokenizer.timestamp_begin)
 
             # apply the `max_initial_timestamp` option
             if self.max_initial_timestamp_index is not None:
                 last_allowed = (
                     self.tokenizer.timestamp_begin + self.max_initial_timestamp_index
                 )
-                mask[:, last_allowed + 1 :] = -np.inf
+                forbidden = forbidden | (token_ids > last_allowed)
 
         # if sum of probability over timestamps is above any other token, sample timestamp
-        logits = logits + mx.array(mask, logits.dtype)
+        logits = mx.where(forbidden, -mx.inf, logits)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        for k in range(tokens.shape[0]):
-            timestamp_logprob = logprobs[k, self.tokenizer.timestamp_begin :].logsumexp(
-                axis=-1
-            )
-            max_text_token_logprob = logprobs[k, : self.tokenizer.timestamp_begin].max()
-            if timestamp_logprob > max_text_token_logprob:
-                logits = mx.where(
-                    (mx.arange(logits.shape[0])[:, None] == k)
-                    & (
-                        mx.arange(logits.shape[1])[None, :]
-                        < self.tokenizer.timestamp_begin
-                    ),
-                    -mx.inf,
-                    logits,
-                )
-
-        return logits
+        timestamp_logprob = mx.logsumexp(
+            logprobs[:, self.tokenizer.timestamp_begin :], axis=-1, keepdims=True
+        )
+        max_text_token_logprob = mx.max(
+            logprobs[:, : self.tokenizer.timestamp_begin], axis=-1, keepdims=True
+        )
+        return mx.where(
+            (timestamp_logprob > max_text_token_logprob)
+            & (token_ids < self.tokenizer.timestamp_begin),
+            -mx.inf,
+            logits,
+        )
 
 
 class DecodingTask:
