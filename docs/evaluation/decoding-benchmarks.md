@@ -56,7 +56,46 @@ and held-out audio fixture are provided.
 
 ## Local comparison runbook
 
-Status (2026-10-14): **54 saved real-model comparisons assessed; merge blocked**.
+Status (2026-10-14): **redesigned parity passes; acceleration unqualified**.
+The clean redesign checkpoint
+`634d41abb16c4112c8b5966212290f81bfbf3f2b` completed all 54 comparisons with
+two warmups and seven timed repetitions per mode. The same nine English fixture
+buckets, base target/tiny assistant, float16, lookahead 1/2/4, and two independent
+passes were used. Every ordinary baseline matches the original recorded tokens,
+text, language, and decision scores exactly.
+
+| Measured gate | Original `e476c7d` | Redesign `634d41a` |
+| --- | --- | --- |
+| Stable baseline tokens and decision scores | 54/54 | 54/54 |
+| Exact candidate tokens/text/language, including timestamps | 50/54 | 54/54 |
+| Candidate decision-score parity | 28/54 | 54/54 |
+| At least 1.2x median speedup | 0/54 | 0/54 |
+| Baseline/candidate median-time ratio | 0.549–0.744 | 0.599–0.833 |
+
+The redesigned candidate takes 1.20–1.67x ordinary decoding time; no bucket is
+promoted. The median ratio is 0.694. Separate measurement windows do not establish
+an absolute before/after speed improvement. Queued verification preserves target
+arithmetic but still executes target steps per token while adding assistant work.
+Per-invocation MLX active-allocation peaks were 1,227,462,806–1,231,149,210 bytes
+with both selected models resident; these are not process RSS or accelerator-only
+memory overhead. All comparisons completed without an OOM/crash.
+
+Seven real-model API pairs also passed text/language, segment token/timestamp and
+decision-score parity: clean, conditioned long-form, selected clip ranges, word
+alignment (62 words), digital silence, speech/music, and forced temperature-0.2
+fallback. The ordinary CLI ran offline with existing model files and returned the
+same transcript as the clean API case. These are bounded equivalence checks, not
+ground-truth accuracy, other-language, arbitrary-threshold or MTP qualification.
+
+Preflight recorded AC power, thermal state nominal then fair (never observed
+serious/critical), and adequate free memory. Per-comparison receipts include
+background GPU utilization and memory readings. The run resumed after a guard
+mistook its own just-finished GPU activity for contention; the completed result
+was retained and a bounded cooldown added. Background desktop activity remains
+a performance-qualification limitation. No other workload was interrupted.
+
+### Original failure evidence
+
 The October 10–11 results identify clean source revision
 `e476c7dcc37e5b0689d007ebd94dd3a1c693e96e`, MLX 0.32.2, Python 3.12.15,
 macOS 27.2 arm64, float16 base target and tiny assistant, and English fixtures.
@@ -80,7 +119,8 @@ qualify MTP, other model pairs, quantization, languages, or full transcription.
 Saved files do not establish contemporaneous GPU contention or thermal conditions;
 they are retained failure evidence, not proof of uncontended performance.
 
-Raw audio, transcripts, model artifacts, and result JSON remain outside Git.
+Raw audio, transcripts, model artifacts, result JSON, and reconciliation reports
+remain outside Git; only aggregate evidence is recorded here.
 Reassess the unchanged raw outputs when resuming; the prepared matrix manifest
 still says "not executed" and records an earlier source revision. Actual result
 metadata controls the measured revision and result status. No background benchmark
@@ -177,13 +217,13 @@ approval. The JSON separately records the 1.2x median speed threshold.
 
 | Gate | Required evidence | Current status |
 | --- | --- | --- |
-| Synthetic correctness | All native regressions pass on final source | 169 passed on `e476c7d` on 2026-10-14; synthetic correctness, no real-model qualification |
-| Lossless clip decode | Every baseline and candidate repetition matches tokens/text/language and passes decision-score tolerance | Failed: exactness 50/54; scores 28/54 |
-| Performance | At least 1.2x median speedup in each promoted bucket, reproduced across independent passes | Failed: 0/54; measured ratios 0.549–0.744 |
-| Stability | No OOM/crash; stable baseline durations and uncontended runs | 54 complete saved comparisons with stable baseline outputs; contemporaneous contention/thermal evidence not established |
-| Full transcription | Long-form API/CLI run; identical text and segment timestamps, silence handling and fallback | Pending; clip benchmark does not cover this |
+| Synthetic correctness | All native regressions pass on final source | 173 passed on redesign source; independent affected-path checks also passed |
+| Lossless clip decode | Every baseline and candidate repetition matches tokens/text/language and passes decision-score tolerance | Passed 54/54 on `634d41a` |
+| Performance | At least 1.2x median speedup in each promoted bucket, reproduced across independent passes | Failed: 0/54; measured ratios 0.599–0.833 |
+| Stability | No OOM/crash; stable baseline durations and uncontended runs | 54 complete comparisons, stable baseline outputs, no OOM/crash; background GPU activity limits timing qualification |
+| Full transcription | Long-form API/CLI run; identical text and segment timestamps, silence handling and fallback | Seven bounded API pairs and ordinary offline CLI passed; broader languages and arbitrary score-threshold boundaries remain unqualified |
 | MTP qualification | Correctly aligned training, held-out loss/acceptance, compatible checkpoint, parity/speed results | Pending trained artifact |
-| Review/integration | Clean required review sources, required CI/human approvals, no conflicts, final-head check | Independent Codex clean at `e476c7d` in cumulative round 7/10; Copilot removed as a required gate by Andrew on 2026-10-10; recheck integration requirements after benchmark qualification |
+| Review/integration | Clean required review sources, required CI/human approvals, no conflicts, final-head check | PR review source retired clean at `e476c7d` in cumulative round 7/10; separate redesign implementation verification and final raw-evidence reconciliation passed; acceleration unqualified, PR remains open |
 
 Real benchmark data is a minimum merge gate, not sufficient by itself. A speed
 failure keeps that mode experimental and blocks its promotion; never replace a

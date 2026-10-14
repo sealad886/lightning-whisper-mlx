@@ -57,6 +57,9 @@ whisper = LightningWhisperMLX(
 Both modes verify every proposed token with the target model. Rejected proposals
 are corrected by the target, and existing timestamp/suppression filters remain
 canonical. No accelerator is enabled automatically without benchmark evidence.
+Speculative modes remain experimental: the local base/tiny English matrix passes
+output parity after the decoder redesign, but runs slower than ordinary decoding.
+See the [measured results](docs/evaluation/decoding-benchmarks.md) before enabling one.
 
 ## Development
 

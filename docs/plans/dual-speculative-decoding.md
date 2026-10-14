@@ -115,3 +115,24 @@ about 2.2e-8. Draft filtering reduced verification rounds from 26 to 22. Single
 profiles still ran slower than ordinary target decoding; these observations are
 diagnostics, not full-matrix qualification or a speedup claim. Isolated float32
 and fused-attention experiments did not establish a speedup and were not adopted.
+
+Completed evidence at clean redesign checkpoint `634d41a`:
+
+- All 173 native regressions passed. Independent affected-path verification passed
+  35 tests, 54 timestamp-rule comparisons and 108 verifier scenarios.
+- All 54 real comparisons passed exact output and decision-score parity. Every
+  baseline output and score remains identical to the original recorded baseline.
+- Seven real full-transcription API pairs and an ordinary offline CLI run passed;
+  long-form conditioning, clip ranges, word alignment, silence and fallback covered.
+- Independent reconciliation verified raw results, repetitions/order, model and
+  fixture hashes, timing and memory summaries. Original assets/results preserved.
+- No comparison reaches 1.2x speedup. Ratios 0.599–0.833, median 0.694. Strict
+  queued arithmetic still executes target work per token and adds assistant work.
+  Acceleration remains experimental and unpromoted; PR #1 remains open and no
+  branch/worktree cleanup or merge is justified by these performance results.
+
+Remaining acceptance: a measured faster exact target execution design, broader
+language/model/quantization coverage as claims expand, score-threshold boundaries,
+and a separately trained compatible MTP artifact. Do not repeat completed source
+inventory, merges or benchmark runs blindly; resume from retained source/result
+identities and the measured performance gap.
