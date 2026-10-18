@@ -6,8 +6,7 @@ from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 import numpy as np
-import tqdm
-import time
+from dataclasses import dataclass
 
 from .audio import (
     FRAMES_PER_SECOND,
@@ -64,7 +63,140 @@ class ModelHolder:
         return cls.model
 
 
+@dataclass
+class _DecodeRequest:
+    model: object
+    mel: mx.array
+    options: DecodingOptions
+    audio_features: object = None
+
+
+def _run_transcriptions(jobs, batch_size):
+    """Cooperatively batch compatible windows without sharing transcript state."""
+    outputs = [None] * len(jobs)
+    pending = {}
+
+    def advance(index, value=None, initial=False):
+        try:
+            pending[index] = next(jobs[index]) if initial else jobs[index].send(value)
+        except StopIteration as done:
+            outputs[index] = done.value
+            pending.pop(index, None)
+
+    for index in range(len(jobs)):
+        advance(index, initial=True)
+    try:
+        while pending:
+            groups = []
+            for index, request in pending.items():
+                # Exact option equality preserves per-record prompts, language,
+                # filters and fallback. Speculation remains explicitly single-row.
+                key = (
+                    id(request.model),
+                    repr(request.options),
+                    request.audio_features is not None,
+                )
+                width = request.mel.shape[0]
+                for group in groups:
+                    if (
+                        group[0] == key
+                        and group[1] + width <= batch_size
+                        and request.options.speculative_mode == "none"
+                    ):
+                        group[1] += width
+                        group[2].append((index, request))
+                        break
+                else:
+                    groups.append([key, width, [(index, request)]])
+            # Complete the whole wave before advancing a job, bounding model work
+            # and keeping pending requests stable while iterating the groups.
+            completed = []
+            for _, _, group in groups:
+                first = group[0][1]
+                mel = mx.concatenate([r.mel for _, r in group], axis=0)
+                features = None
+                if first.audio_features is not None:
+                    features = mx.concatenate(
+                        [r.audio_features for _, r in group], axis=0
+                    )
+                results = first.model.decode(
+                    mel, first.options, audio_features=features
+                )
+                if len(results) != mel.shape[0]:
+                    raise RuntimeError(
+                        "decoder result count differs from scheduled rows"
+                    )
+                offset = 0
+                for index, request in group:
+                    end = offset + request.mel.shape[0]
+                    completed.append((index, results[offset:end]))
+                    offset = end
+            for index, results in completed:
+                advance(index, results)
+    finally:
+        for job in jobs:
+            job.close()
+    return outputs
+
+
 def transcribe_audio(
+    audio,
+    *,
+    path_or_hf_repo="mlx-community/whisper-tiny",
+    model_instance=None,
+    **options,
+):
+    """Transcribe one recording using an optional explicitly resident model."""
+    return transcribe_many_audio(
+        [audio],
+        path_or_hf_repo=path_or_hf_repo,
+        model_instance=model_instance,
+        **options,
+    )[0]
+
+
+def transcribe_many_audio(
+    audios,
+    *,
+    path_or_hf_repo="mlx-community/whisper-tiny",
+    model_instance=None,
+    batch_size=6,
+    **options,
+):
+    """Transcribe a bounded batch of independent recordings, preserving input order.
+
+    Each recording retains its own prompts, seek, language and fallback state.
+    Compatible windows share model execution; incompatible requests run separately.
+    """
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size < 1
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    audios = list(audios)
+    if not audios:
+        return []
+    dtype = mx.float16 if options.get("fp16", True) else mx.float32
+    model = model_instance or ModelHolder.get_model(path_or_hf_repo, dtype)
+    outputs = []
+    # Bound both active window tensors and preprocessed recording residency.
+    for start in range(0, len(audios), batch_size):
+        jobs = [
+            _transcribe_audio(
+                audio,
+                path_or_hf_repo=path_or_hf_repo,
+                model_instance=model,
+                batch_size=batch_size,
+                **options,
+            )
+            for audio in audios[start : start + batch_size]
+        ]
+        outputs.extend(_run_transcriptions(jobs, batch_size))
+    return outputs
+
+
+def _transcribe_audio(
     audio: Union[str, np.ndarray, mx.array],
     *,
     path_or_hf_repo: str = "mlx-community/whisper-tiny",
@@ -81,6 +213,7 @@ def transcribe_audio(
     clip_timestamps: Union[str, List[float]] = "0",
     hallucination_silence_threshold: Optional[float] = None,
     batch_size: int = 6,
+    model_instance=None,
     **decode_options,
 ):
     """
@@ -149,7 +282,11 @@ def transcribe_audio(
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
 
-    if not isinstance(batch_size, int) or batch_size < 1:
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size < 1
+    ):
         raise ValueError("batch_size must be a positive integer")
     temperatures = (
         [temperature] if isinstance(temperature, (int, float)) else list(temperature)
@@ -157,7 +294,11 @@ def transcribe_audio(
     if not temperatures or any(not np.isfinite(t) or t < 0 for t in temperatures):
         raise ValueError("temperature must contain finite, non-negative values")
     dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
-    model = ModelHolder.get_model(path_or_hf_repo, dtype)
+    model = model_instance or ModelHolder.get_model(path_or_hf_repo, dtype)
+    if decode_options.get("task", "transcribe") == "translate" and not getattr(
+        model, "supports_translation", True
+    ):
+        raise ValueError("selected model does not support translation")
 
     assistant = None
     if decode_options.get("speculative_mode") == "assistant":
@@ -180,6 +321,7 @@ def transcribe_audio(
         else:
             make_safe = lambda x: x
 
+    detected_features = None
     if decode_options.get("language", None) is None:
         if not model.is_multilingual:
             decode_options["language"] = "en"
@@ -190,7 +332,8 @@ def transcribe_audio(
                     "Use the `language` decoding option to specify the language"
                 )
             mel_segment = pad_or_trim(mel, N_FRAMES, axis=-2).astype(dtype)
-            _, probs = model.detect_language(mel_segment)
+            detected_features = model.embed_audio(mel_segment[None])[0]
+            _, probs = model.detect_language(detected_features)
             decode_options["language"] = max(probs, key=probs.get)
             if verbose is not None:
                 print(
@@ -260,7 +403,7 @@ def transcribe_audio(
     if word_timestamps and task == "translate":
         warnings.warn("Word-level timestamps on translations may not be reliable.")
 
-    def decode_process(segment_batch, t):
+    def decode_process(segment_batch, t, features):
         kwargs = {**decode_options}
         if t > 0:
             kwargs.pop("beam_size", None)
@@ -276,14 +419,20 @@ def transcribe_audio(
                 mtp_head=None,
             )
         options = DecodingOptions(**kwargs, temperature=t)
-        decode_results = model.decode(segment_batch, options)
+        decode_results = yield _DecodeRequest(model, segment_batch, options, features)
         return decode_results
 
-    def decode_with_fallback(segment_batch: mx.array) -> DecodingResult:
+    def decode_with_fallback(segment_batch: mx.array, features=None):
         final_decode = [None] * segment_batch.shape[0]
         pending = list(range(segment_batch.shape[0]))
         for t in temperatures:
-            results = decode_process(segment_batch[pending], t)
+            results = yield from decode_process(
+                segment_batch[pending],
+                t,
+                None if features is None else features[pending],
+            )
+            if features is None:
+                features = mx.stack([result.audio_features for result in results])
             retry = []
             for index, result in zip(pending, results):
                 final_decode[index] = result
@@ -457,6 +606,7 @@ def transcribe_audio(
                 prepend_punctuations=prepend_punctuations,
                 append_punctuations=append_punctuations,
                 last_speech_timestamp=last_speech_timestamp,
+                audio_features=res.audio_features,
             )
 
             if not single_timestamp_ending:
@@ -560,7 +710,26 @@ def transcribe_audio(
                 candidate_seek += size
 
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
-            results = decode_with_fallback(mx.stack([chunk[2] for chunk in chunks]))
+            features = None
+            if (
+                detected_features is not None
+                and content_frames >= N_FRAMES
+                and chunks[0][0] == 0
+                and chunks[0][1] == N_FRAMES
+            ):
+                # Only a full first window has the same encoder input as
+                # detection. Short windows zero-pad log-mel after trimming,
+                # whereas detection includes waveform-silence padding frames.
+                features = detected_features[None]
+                if len(chunks) > 1:
+                    remaining = model.embed_audio(
+                        mx.stack([chunk[2] for chunk in chunks[1:]])
+                    )
+                    features = mx.concatenate([features, remaining], axis=0)
+            detected_features = None
+            results = yield from decode_with_fallback(
+                mx.stack([chunk[2] for chunk in chunks]), features
+            )
             for (current_seek, size, mel_segment), res in zip(chunks, results):
                 tokens = np.array(res.tokens)
                 current_segments, next_seek = format_output(

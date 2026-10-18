@@ -18,7 +18,6 @@ def test_lightning_api_exposes_speculative_configuration():
 def test_assistant_alias_resolves_for_all_supported_quantization(quant, monkeypatch):
     from lightning_whisper_mlx import lightning
 
-    monkeypatch.setattr(lightning, "hf_hub_download", lambda **kwargs: None)
     model = LightningWhisperMLX(
         model="base",
         speculative_mode="assistant",
@@ -28,7 +27,7 @@ def test_assistant_alias_resolves_for_all_supported_quantization(quant, monkeypa
     )
     assert (
         model.speculative_options.assistant_model
-        == lightning.models["tiny"][quant or "base"]
+        == lightning.model_spec("tiny", quant).repository
     )
 
 
@@ -39,7 +38,7 @@ def test_speculative_batch_rejected_before_download(mode, monkeypatch):
     def unexpected_download(**kwargs):
         pytest.fail("invalid configuration must not start a download")
 
-    monkeypatch.setattr(lightning, "hf_hub_download", unexpected_download)
+    monkeypatch.setattr(lightning, "resolve_model_path", unexpected_download)
     with pytest.raises(ValueError, match="batch_size=1"):
         LightningWhisperMLX(
             model="base",
@@ -77,20 +76,21 @@ def test_transcription_rejects_assistant_with_different_mel_bins(monkeypatch):
         )
 
 
-def test_distil_assistant_alias_rejected_before_download(monkeypatch):
+def test_distil_assistant_is_deferred_without_constructor_download(monkeypatch):
     from lightning_whisper_mlx import lightning
 
-    def unexpected_download(**kwargs):
-        pytest.fail("unsupported layout must not start a download")
-
-    monkeypatch.setattr(lightning, "hf_hub_download", unexpected_download)
-    with pytest.raises(ValueError, match="unsupported nested layout"):
-        LightningWhisperMLX(
-            model="base",
-            speculative_mode="assistant",
-            assistant_model="distil-small.en",
-            batch_size=1,
-        )
+    monkeypatch.setattr(
+        lightning,
+        "resolve_model_path",
+        lambda *args, **kwargs: pytest.fail("constructor must not download"),
+    )
+    model = LightningWhisperMLX(
+        "base",
+        speculative_mode="assistant",
+        assistant_model="distil-small.en",
+        batch_size=1,
+    )
+    assert model.speculative_options.assistant_model == "distil-small.en"
 
 
 @pytest.mark.parametrize("checkpoint_options", [{}, {"mtp_checkpoint": None}])

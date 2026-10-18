@@ -4,16 +4,19 @@ Whisper transcription for Apple Silicon, with batching, quantized models, and op
 
 ![Whisper Decoding Speed](./speed_image.png)
 
-The chart records historical results. Current-source speed, accuracy, and memory
-comparisons against Whisper CPP and MLX Whisper remain unqualified until
-reproducible benchmarks return data.
+The chart records historical results. The native engine now has direct, repeated
+Metal whisper.cpp comparisons: observed warm aggregate speedups were 1.19–1.24×
+on an M3 Pro with base/tiny. These are bounded observations under desktop load,
+not a universal minimum. Speech quality passed the relative reference gate;
+timestamp-free long silence failed in both engines. See the
+[current measurements and limitations](docs/evaluation/native-engine.md).
 
 ## Features
 
-- **Batched Decoding** -> Higher Throughput
-- **Distilled Models** -> Faster Decoding (less layers)
-- **Quantized Models** -> Faster Memory Movement
-- **Lossless speculative decoding** -> Optional assistant-model or MTP acceleration
+- Fused MLX attention, packed projections and compiled cached greedy decoding.
+- Resident model sessions, offline local artifacts and bounded recording batches.
+- Greedy, sampling, beam search and word alignment through the same model graph.
+- Optional distilled/quantized artifacts and experimental verified speculation.
 
 ## Installation
 
@@ -25,10 +28,12 @@ pip install lightning-whisper-mlx
 
 ## Usage
 
-Models
+Named models
 
 ```
-["tiny", "small", "distil-small.en", "base", "medium", distil-medium.en", "large", "large-v2", "distil-large-v2", "large-v3", "distil-large-v3"]
+tiny, tiny.en, base, base.en, small, small.en, medium, medium.en,
+large-v1, large-v2, large-v3, large, large-v3-turbo, turbo,
+distil-small.en, distil-medium.en, distil-large-v2, distil-large-v3
 ```
 
 Quantization
@@ -36,6 +41,35 @@ Quantization
 ```
 [None, "4bit", "8bit"]
 ```
+
+Quantized catalog variants are available for the multilingual and distilled
+families; English-only and turbo entries currently select dense artifacts.
+`large` selects large-v3; use `large-v1` explicitly for the original model.
+English-only, distilled and turbo entries reject translation. Catalog support is
+broader than measured runtime coverage: this change was qualified with local
+dense base/tiny artifacts.
+
+```python
+from lightning_whisper_mlx import LightningWhisperMLX
+
+whisper = LightningWhisperMLX(
+    model="/path/to/model",  # config.json + weights.npz or weights.safetensors
+    local_files_only=True,
+    batch_size=3,
+)
+result = whisper.transcribe("recording.wav", language="en")
+results = whisper.transcribe_many(["one.wav", "two.wav"], language="en")
+beam_result = whisper.transcribe("recording.wav", language="en", beam_size=3,
+                                  temperature=0.0)
+```
+
+Each engine lazily loads and retains its own model. Named/Hub models use the
+Hugging Face cache, optionally selected with `cache_dir`; existing local artifacts
+are read in place. Encoder and cached decoder compilation are enabled by default.
+The first call includes loading/compilation costs. Set `compile_encoder=False,
+compile_decoder=False` when constructing an engine to select eager execution.
+The optional `pipeline=True` transcription setting queues one additional step;
+it remains disabled by default because it lost the interleaved policy comparison.
 
 Speculative decoding is opt-in and supports temperature-zero greedy decoding.
 `none` remains the default. Assistant mode currently requires `batch_size=1` and
@@ -112,7 +146,11 @@ print(text)
 
 ## Notes
 
-- The default `batch_size` is `12`. Conditioned long-form transcription decodes
+- The default `batch_size` is `12`. `transcribe_many` returns results in input
+  order and batches compatible active windows from independent recordings while
+  retaining each recording's own prompt, language and fallback state. One engine
+  serializes simultaneous callers; use the batching API for shared-model work.
+  Conditioned long-form transcription decodes
   sequentially to preserve previous-text context. Use
   `condition_on_previous_text=False` to batch independent windows. Larger batches
   increase memory use; their throughput benefit requires measurement.
@@ -123,6 +161,10 @@ print(text)
   and decoder scores. `word_timestamps=True` additionally produces aligned words.
 - [MTP training](docs/training/mtp-training.md) documents the local-only pipeline.
   Completing the workflow does not establish trained-head quality or speed.
+- The [engine design](docs/design/native-inference-engine.md),
+  [implementation plan](docs/plans/native-inference-engine.md) and
+  [benchmark runbook](docs/evaluation/native-engine.md) describe the graph,
+  decisions, measured scope and remaining qualification work.
 
 ## Credits
 

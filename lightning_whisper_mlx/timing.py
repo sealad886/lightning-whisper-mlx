@@ -118,6 +118,7 @@ def find_alignment(
     *,
     medfilt_width: int = 7,
     qk_scale: float = 1.0,
+    audio_features=None,
 ) -> List[WordTiming]:
     if len(text_tokens) == 0:
         return []
@@ -131,7 +132,11 @@ def find_alignment(
         ]
     )
 
-    logits, cross_qk = model.forward_with_cross_qk(mel[None, :], tokens[None, :])
+    logits, cross_qk = model.forward_with_cross_qk(
+        mel[None, :],
+        tokens[None, :],
+        audio_features=None if audio_features is None else audio_features[None],
+    )
     # consider only the logits associated with predicting text
     sampled_logits = logits[0][len(tokenizer.sot_sequence) : -2, : tokenizer.eot]
     token_probs = mx.softmax(sampled_logits.astype(mx.float32), axis=-1).astype(

@@ -30,9 +30,12 @@ def transcription(monkeypatch):
 
         def __init__(self):
             self.calls = []
+            self.encodings = 0
             self.answer = lambda start, options: {}
 
-        def decode(self, batch, options):
+        def decode(self, batch, options, audio_features=None):
+            if audio_features is None:
+                self.encodings += 1
             starts = [int(batch[i, 0, 0].item()) for i in range(batch.shape[0])]
             self.calls.append((starts, options))
             return [
@@ -43,10 +46,11 @@ def transcription(monkeypatch):
                         "avg_logprob": -0.1,
                         "no_speech_prob": 0.0,
                         "compression_ratio": 1.0,
+                        "audio_features": batch[i],
                         **self.answer(start, options),
                     }
                 )
-                for start in starts
+                for i, start in enumerate(starts)
             ]
 
     model = Model()
@@ -58,7 +62,9 @@ def transcription(monkeypatch):
             np.arange(round(seconds * 100) + 3000, dtype=np.float32)[:, None]
         )
         monkeypatch.setattr(tr, "log_mel_spectrogram", lambda *args, **kwargs: mel)
-        return tr.transcribe_audio("unused", language="en", fp16=False, **kwargs)
+        return tr.transcribe_audio(
+            "unused", language=kwargs.pop("language", "en"), fp16=False, **kwargs
+        )
 
     return model, run
 
@@ -133,6 +139,39 @@ def test_fallback_honors_schedule_and_retries_only_failed_rows(transcription):
         ([0], 0.6),
     ]
     assert [options.best_of for _, options in model.calls] == [None, 2, 2]
+    assert model.encodings == 1
+
+
+def test_independent_recordings_batch_without_sharing_conditioned_prompts(
+    transcription, monkeypatch
+):
+    model, _ = transcription
+    monkeypatch.setattr(
+        tr,
+        "log_mel_spectrogram",
+        lambda audio, **kwargs: mx.array(
+            (np.arange(9000, dtype=np.float32) + audio)[:, None]
+        ),
+    )
+    result = tr.transcribe_many_audio(
+        [0, 30000],
+        model_instance=model,
+        language="en",
+        fp16=False,
+        batch_size=2,
+        temperature=0.0,
+    )
+    # First windows share a compatible empty prompt. Subsequent prompts differ,
+    # so each recording continues independently without changing its semantics.
+    assert [starts for starts, _ in model.calls] == [[0, 30000], [3000], [33000]]
+    assert [options.prompt for _, options in model.calls] == [[], [1], [11]]
+    assert [row["text"] for row in result] == ["1 2 ", "11 12 "]
+    assert [[s["seek"] for s in row["segments"]] for row in result] == [[0, 3000]] * 2
+
+
+def test_empty_request_batch_does_not_load_a_model(monkeypatch):
+    monkeypatch.setattr(tr.ModelHolder, "get_model", lambda *a: pytest.fail("loaded"))
+    assert tr.transcribe_many_audio([]) == []
 
 
 def test_scalar_temperature_has_no_implicit_retry(transcription):
@@ -163,6 +202,7 @@ def test_word_timestamps_use_existing_alignment_and_absolute_clip_offset(
 
     def align(model, tokenizer, tokens, mel, num_frames, **kwargs):
         aligned.append((tokens, int(mel[0, 0].item()), num_frames))
+        assert mx.array_equal(kwargs["audio_features"], mel).item()
         return [timing.WordTiming("hello", [1], 1.0, 2.0, 0.99)]
 
     monkeypatch.setattr(timing, "find_alignment", align)
@@ -210,3 +250,61 @@ def test_model_cache_reloads_on_dtype_or_artifact_change(monkeypatch, tmp_path):
     (tmp_path / "weights.npz").write_bytes(b"replacement-weights")
     tr.ModelHolder.get_model(str(tmp_path), mx.float32)
     assert calls == [mx.float16, mx.float32, mx.float32]
+
+
+@pytest.mark.parametrize("seconds", [30, 65])
+def test_auto_language_reuses_first_full_window_in_batch(transcription, seconds):
+    model, run = transcription
+    model.is_multilingual, model.num_languages = True, 99
+    encoded = []
+
+    def encode(batch):
+        encoded.extend(batch[:, 0, 0].tolist())
+        return batch
+
+    model.embed_audio = encode
+    model.detect_language = lambda features: (None, {"en": 1.0})
+    run(seconds, language=None, batch_size=3, condition_on_previous_text=False)
+    assert encoded == list(range(0, round(seconds * 100), 3000))
+    assert model.encodings == 0
+
+
+def test_auto_language_features_do_not_replace_a_clipped_partial_window(transcription):
+    model, run = transcription
+    model.is_multilingual, model.num_languages = True, 99
+    model.embed_audio = lambda batch: batch
+    model.detect_language = lambda features: (None, {"en": 1.0})
+    run(60, language=None, batch_size=3, clip_timestamps=[0, 10])
+    assert model.encodings == 1
+
+
+@pytest.mark.parametrize("seconds", [0.01, 10, 29.99])
+def test_short_auto_language_does_not_reuse_differently_padded_features(
+    transcription, seconds
+):
+    model, run = transcription
+    model.is_multilingual, model.num_languages = True, 99
+    language_inputs, transcription_inputs, supplied_features = [], [], []
+
+    def encode(batch):
+        language_inputs.append(batch)
+        return batch
+
+    original_decode = model.decode
+
+    def decode(batch, options, audio_features=None):
+        transcription_inputs.append(batch)
+        supplied_features.append(audio_features)
+        return original_decode(batch, options, audio_features=audio_features)
+
+    model.embed_audio = encode
+    model.detect_language = lambda features: (None, {"en": 1.0})
+    model.decode = decode
+    run(seconds, language=None, batch_size=3)
+    # Language detection retains mel frames from waveform silence padding.
+    # The actual short transcription window pads its log-mel tensor with zeros.
+    assert language_inputs[0].shape == transcription_inputs[0].shape
+    assert not mx.array_equal(language_inputs[0], transcription_inputs[0]).item()
+    assert len(supplied_features) == 1
+    assert supplied_features[0] is None
+    assert model.encodings == 1

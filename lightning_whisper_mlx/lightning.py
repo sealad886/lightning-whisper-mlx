@@ -1,58 +1,17 @@
-from .transcribe import transcribe_audio
+"""Resident Whisper inference sessions with explicit artifact ownership."""
+
+import threading
+from pathlib import Path
+
+import mlx.core as mx
+
+from .load_models import load_model, model_artifact_identity, resolve_model_path
+from .model_catalog import MODEL_CATALOG, model_spec
 from .speculative import SpeculativeOptions, validate_speculative_options
-from huggingface_hub import hf_hub_download
+from .transcribe import transcribe_audio, transcribe_many_audio
 
-models = {
-    "tiny": {
-        "base": "mlx-community/whisper-tiny",
-        "4bit": "mlx-community/whisper-tiny-mlx-4bit",
-        "8bit": "mlx-community/whisper-tiny-mlx-8bit"
-    },
-    "small": {
-        "base": "mlx-community/whisper-small-mlx",
-        "4bit": "mlx-community/whisper-small-mlx-4bit",
-        "8bit": "mlx-community/whisper-small-mlx-8bit"
-    },
-    "distil-small.en": {
-        "base": "mustafaaljadery/distil-whisper-mlx",
-    },
-    "base": {
-        "base" : "mlx-community/whisper-base-mlx",
-        "4bit" : "mlx-community/whisper-base-mlx-4bit",
-        "8bit" : "mlx-community/whisper-base-mlx-8bit"
-    },
-    "medium": {
-        "base": "mlx-community/whisper-medium-mlx",
-        "4bit": "mlx-community/whisper-medium-mlx-4bit",
-        "8bit": "mlx-community/whisper-medium-mlx-8bit"
-    },
-    "distil-medium.en": {
-        "base": "mustafaaljadery/distil-whisper-mlx",
-    },
-    "large": {
-        "base": "mlx-community/whisper-large-mlx",
-        "4bit": "mlx-community/whisper-large-mlx-4bit",
-        "8bit": "mlx-community/whisper-large-mlx-8bit",
-    },
-    "large-v2": {
-        "base": "mlx-community/whisper-large-v2-mlx",
-        "4bit": "mlx-community/whisper-large-v2-mlx-4bit",
-        "8bit": "mlx-community/whisper-large-v2-mlx-8bit",
-    },
-    "distil-large-v2": {
-        "base": "mustafaaljadery/distil-whisper-mlx",
-    },
-    "large-v3": {
-        "base": "mlx-community/whisper-large-v3-mlx",
-        "4bit": "mlx-community/whisper-large-v3-mlx-4bit",
-        "8bit": "mlx-community/whisper-large-v3-mlx-8bit",
-    },
-    "distil-large-v3": {
-        "base": "mustafaaljadery/distil-whisper-mlx",
-    },
-}
 
-class LightningWhisperMLX():
+class LightningWhisperMLX:
     def __init__(
         self,
         model,
@@ -64,27 +23,28 @@ class LightningWhisperMLX():
         assistant_quant=None,
         mtp_checkpoint=None,
         speculative_batch_policy="lockstep",
+        *,
+        local_files_only=False,
+        cache_dir=None,
+        dtype=mx.float16,
+        compile_encoder=True,
+        compile_decoder=True,
     ):
-        if quant and (quant != "4bit" and quant !="8bit"):
-            raise ValueError("Quantization must be `4bit` or `8bit`")
-
-        if model not in models:
-            raise ValueError("Please select a valid model")
-
         if (
-            isinstance(assistant_model, str)
-            and assistant_model in models
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or batch_size < 1
         ):
-            if "distil" in assistant_model:
-                raise ValueError(
-                    f"assistant model {assistant_model!r} uses an unsupported nested layout; "
-                    "pass a repository or local path with root-level weights"
-                )
-            assistant_key = assistant_quant or "base"
-            if assistant_key not in models[assistant_model]:
-                raise ValueError("assistant_quant is unavailable for assistant_model")
-            assistant_model = models[assistant_model][assistant_key]
-
+            raise ValueError("batch_size must be a positive integer")
+        if dtype not in (mx.float16, mx.float32):
+            raise ValueError("dtype must be mlx.float16 or mlx.float32")
+        self._spec = (
+            None if Path(model).expanduser().exists() else model_spec(model, quant)
+        )
+        if assistant_model is not None:
+            assistant_spec = model_spec(assistant_model, assistant_quant)
+            if assistant_spec and not assistant_spec.subdirectory:
+                assistant_model = assistant_spec.repository
         self.speculative_options = SpeculativeOptions(
             speculative_mode=speculative_mode,
             lookahead=lookahead,
@@ -96,35 +56,65 @@ class LightningWhisperMLX():
         validate_speculative_options(self.speculative_options, temperature=0.0)
         if speculative_mode != "none" and batch_size != 1:
             raise ValueError("speculative decoding requires batch_size=1")
-
-        self.name = model
+        self.name = str(model)
         self.batch_size = batch_size
+        self.quant = quant
+        self.dtype = dtype
+        self.compile_encoder = compile_encoder
+        self.compile_decoder = compile_decoder
+        self.local_files_only = local_files_only
+        self.cache_dir = cache_dir
+        self._source = model
+        self._path = None
+        self._model = None
+        self._identity = None
+        self._assistant_path = None
+        self._assistant_identity = None
+        self._assistant = None
+        # One session serializes its mutable execution state. Separate sessions
+        # own separate models and never evict one another's resident weights.
+        self._lock = threading.RLock()
 
-        repo_id = ""
+    @property
+    def model_path(self):
+        with self._lock:
+            if self._path is None:
+                self._path = resolve_model_path(
+                    self._source,
+                    quant=self.quant,
+                    local_files_only=self.local_files_only,
+                    cache_dir=self.cache_dir,
+                )
+            return self._path
 
-        if quant and "distil" not in model:
-            repo_id = models[model][quant]
-        else:
-            repo_id = models[model]['base']
+    def _get_model(self, dtype):
+        identity = (model_artifact_identity(self.model_path), dtype)
+        if self._model is None or identity != self._identity:
+            self._model = load_model(
+                str(self.model_path), dtype=dtype, model_name=self.name
+            )
+            if self.compile_encoder or self.compile_decoder:
+                self._model.configure_execution(
+                    compile_encoder=self.compile_encoder,
+                    compile_decoder=self.compile_decoder,
+                )
+            self._identity = identity
+        return self._model
 
-        if quant:
-            # Distilled repositories use their existing nested artifact names.
-            suffix = f"-{quant[0]}-bit" if "distil" in model else f"-{quant}"
-            self.name += suffix
-
-        if "distil" in model:
-            filename1 = f"./mlx_models/{self.name}/weights.npz"
-            filename2 = f"./mlx_models/{self.name}/config.json"
-            local_dir = "./"
-        else:
-            filename1 = "weights.npz"
-            filename2 = "config.json"
-            local_dir = f"./mlx_models/{self.name}"
-
-        hf_hub_download(repo_id=repo_id, filename=filename1, local_dir=local_dir)
-        hf_hub_download(repo_id=repo_id, filename=filename2, local_dir=local_dir)
+    @property
+    def model(self):
+        """The session's lazily loaded resident model at its default precision."""
+        with self._lock:
+            return self._get_model(self.dtype)
 
     def transcribe(self, audio_path, language=None, **decode_options):
+        return self._transcribe(audio_path, language, decode_options, many=False)
+
+    def transcribe_many(self, audio_paths, language=None, **decode_options):
+        """Batch independent recordings with isolated prompts and result ordering."""
+        return self._transcribe(audio_paths, language, decode_options, many=True)
+
+    def _transcribe(self, audio, language, decode_options, *, many):
         options = {
             "speculative_mode": self.speculative_options.speculative_mode,
             "lookahead": self.speculative_options.lookahead,
@@ -134,11 +124,51 @@ class LightningWhisperMLX():
             "speculative_batch_policy": self.speculative_options.speculative_batch_policy,
             **decode_options,
         }
-        result = transcribe_audio(
-            audio_path,
-            path_or_hf_repo=f'./mlx_models/{self.name}',
-            language=language,
-            batch_size=self.batch_size,
-            **options,
-        )
-        return result
+        options.setdefault("fp16", self.dtype == mx.float16)
+        if (
+            options.get("task", "transcribe") == "translate"
+            and self._spec
+            and not self._spec.translate
+        ):
+            raise ValueError(f"model {self.name!r} does not support translation")
+        with self._lock:
+            model = self._get_model(mx.float16 if options["fp16"] else mx.float32)
+            if options.get("task", "transcribe") == "translate" and not getattr(
+                model, "supports_translation", True
+            ):
+                raise ValueError(f"model {self.name!r} does not support translation")
+            assistant = options.get("assistant_model")
+            if options["speculative_mode"] == "assistant" and isinstance(
+                assistant, (str, Path)
+            ):
+                assistant_quant = options.get("assistant_quant")
+                # A resolved repository already selects its quantized variant.
+                quant = assistant_quant if str(assistant) in MODEL_CATALOG else None
+                key = (str(assistant), quant)
+                if self._assistant_path is None or self._assistant_path[0] != key:
+                    path = resolve_model_path(
+                        assistant,
+                        quant=quant,
+                        local_files_only=self.local_files_only,
+                        cache_dir=self.cache_dir,
+                    )
+                    self._assistant_path = (key, path)
+                path = self._assistant_path[1]
+                identity = (model_artifact_identity(path), options["fp16"])
+                if self._assistant is None or identity != self._assistant_identity:
+                    self._assistant = load_model(
+                        str(path),
+                        dtype=mx.float16 if options["fp16"] else mx.float32,
+                        model_name=str(assistant),
+                    )
+                    self._assistant_identity = identity
+                options["assistant_model"] = self._assistant
+            transcribe = transcribe_many_audio if many else transcribe_audio
+            return transcribe(
+                audio,
+                path_or_hf_repo=str(self.model_path),
+                model_instance=model,
+                language=language,
+                batch_size=self.batch_size,
+                **options,
+            )

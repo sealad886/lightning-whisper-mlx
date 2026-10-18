@@ -1,5 +1,9 @@
 # Decoding benchmarks
 
+For the 2026-10-18 ordinary-engine redesign and direct Metal whisper.cpp
+comparisons, see [Native engine measurements](native-engine.md). This page retains
+the separate speculative-decoding results and its stronger exactness contract.
+
 The benchmark is composable: `benchmarks.runner.BenchmarkSuite` owns timing and
 metadata, while callers inject a runner that receives one `BenchmarkCase` and
 returns either any JSON-compatible value or a mapping. Mapping results may include

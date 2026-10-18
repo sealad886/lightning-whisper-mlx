@@ -3,7 +3,7 @@
 import os
 from functools import lru_cache
 from subprocess import CalledProcessError, run
-from typing import Optional, Union
+from typing import Union
 
 import mlx.core as mx
 import numpy as np
@@ -13,8 +13,8 @@ SAMPLE_RATE = 16000
 N_FFT = 400
 HOP_LENGTH = 160
 CHUNK_LENGTH = 30
-N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  
-N_FRAMES = N_SAMPLES // HOP_LENGTH  
+N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE
+N_FRAMES = N_SAMPLES // HOP_LENGTH
 
 N_SAMPLES_PER_TOKEN = HOP_LENGTH * 2  # the initial convolutions has stride 2
 FRAMES_PER_SECOND = SAMPLE_RATE // HOP_LENGTH  # 10ms per audio frame
@@ -141,19 +141,17 @@ def log_mel_spectrogram(
         The path to audio or either a NumPy or mlx array containing the audio waveform in 16 kHz
 
     n_mels: int
-        The number of Mel-frequency filters, only 80 is supported
+        The number of Mel-frequency filters: 80 or 128, matching the model.
 
     padding: int
         Number of zero samples to pad to the right
 
     Returns
     -------
-    mx.array, shape = (80, n_frames)
+    mx.array, shape = (n_frames, n_mels)
         An  array that contains the Mel spectrogram
     """
-    device = mx.default_device()
-    mx.set_default_device(mx.cpu)
-    try:
+    with mx.stream(mx.cpu):
         if isinstance(audio, str):
             audio = load_audio(audio)
         elif not isinstance(audio, mx.array):
@@ -172,5 +170,3 @@ def log_mel_spectrogram(
         log_spec = mx.maximum(log_spec, log_spec.max() - 8.0)
         log_spec = (log_spec + 4.0) / 4.0
         return log_spec
-    finally:
-        mx.set_default_device(device)

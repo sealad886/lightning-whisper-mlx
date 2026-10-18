@@ -97,7 +97,7 @@ def test_cached_proposal_logits_and_cache_preserve_sequential_arithmetic(dtype):
     expected = []
     for index in range(3):
         row = sequential.forward_one(proposals[:, index : index + 1], audio)
-        mx.eval(row, sequential.kv_cache)
+        mx.eval(row, sequential.cache_state)
         expected.append(row)
 
     queued = Inference(model, initial_token_length=2)
@@ -107,6 +107,5 @@ def test_cached_proposal_logits_and_cache_preserve_sequential_arithmetic(dtype):
     for expected_layer, actual_layer in zip(sequential.kv_cache, queued.kv_cache):
         for expected_pair, actual_pair in zip(expected_layer, actual_layer):
             assert all(
-                mx.array_equal(a, b).item()
-                for a, b in zip(expected_pair, actual_pair)
+                mx.array_equal(a, b).item() for a, b in zip(expected_pair, actual_pair)
             )

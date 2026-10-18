@@ -104,12 +104,24 @@ def environment_metadata() -> dict[str, Any]:
     except PackageNotFoundError:
         mlx_version = "unavailable"
 
+    import hashlib
+
+    root = Path(__file__).resolve().parents[1]
+    source = hashlib.sha256()
+    paths = [root / "setup.py", root / "pyproject.toml"]
+    for directory in ("lightning_whisper_mlx", "benchmarks", "training"):
+        paths.extend((root / directory).rglob("*.py"))
+    for path in sorted(paths):
+        if path.is_file():
+            source.update(str(path.relative_to(root)).encode() + b"\0")
+            source.update(path.read_bytes())
     return {
         "git_revision": revision,
         "git_dirty": dirty,
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "mlx_version": mlx_version,
+        "source_tree_sha256": source.hexdigest(),
     }
 
 

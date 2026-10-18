@@ -44,27 +44,45 @@ def test_loaded_checkpoint_honors_precision_without_casting_packed_weights(
     assert loaded.logits(mx.array([[1, 2]]), features).shape == (1, 2, 32)
 
 
-def test_quantization_variants_have_distinct_download_and_transcription_paths(
-    monkeypatch,
+def test_quantization_variants_resolve_distinct_artifacts_and_own_models(
+    tmp_path, monkeypatch
 ):
-    downloads = []
-    paths = []
-    monkeypatch.setattr(lightning, "hf_hub_download", lambda **kw: downloads.append(kw))
+    from lightning_whisper_mlx.model_catalog import model_spec
+
+    paths = {}
+    for quant in (None, "4bit", "8bit"):
+        path = tmp_path / (quant or "base")
+        path.mkdir()
+        (path / "config.json").write_text("{}")
+        (path / "weights.npz").write_bytes(b"weights")
+        paths[quant] = path
+    resolutions = []
+
+    def resolve(source, **options):
+        resolutions.append(model_spec(source, options["quant"]).repository)
+        return paths[options["quant"]]
+
+    monkeypatch.setattr(lightning, "resolve_model_path", resolve)
     monkeypatch.setattr(
         lightning,
-        "transcribe_audio",
-        lambda *args, **kw: paths.append(kw["path_or_hf_repo"]),
+        "load_model",
+        lambda *args, **kw: SimpleNamespace(configure_execution=lambda **options: None),
     )
-    models = [
+    outputs = []
+    monkeypatch.setattr(
+        lightning, "transcribe_audio", lambda *a, **kw: outputs.append(kw)
+    )
+    engines = [
         lightning.LightningWhisperMLX("tiny", quant=q) for q in (None, "4bit", "8bit")
     ]
-    for model in models:
-        model.transcribe("unused.wav")
-
-    destinations = [downloads[index]["local_dir"] for index in (0, 2, 4)]
-    assert len(set(destinations)) == 3
-    assert destinations == paths
-    assert len({downloads[index]["repo_id"] for index in (0, 2, 4)}) == 3
+    assert not resolutions
+    for engine in engines:
+        engine.transcribe("unused.wav")
+    assert len(set(resolutions)) == 3
+    assert len({id(output["model_instance"]) for output in outputs}) == 3
+    assert [output["path_or_hf_repo"] for output in outputs] == [
+        str(path) for path in paths.values()
+    ]
 
 
 @pytest.mark.parametrize("dtypes", [(mx.float16, mx.float32), (mx.float32, mx.float16)])
