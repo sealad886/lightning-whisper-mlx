@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import ExitStack
 import os
 import shutil
 import subprocess
@@ -161,6 +162,51 @@ def _common_root(sources: Sequence[Path]) -> Path:
     return Path(os.path.commonpath([str(parent) for parent in parents]))
 
 
+def _output_identities(destinations):
+    """Resolve output aliases using the destination filesystem's name rules."""
+    identities, errors, probes = [], {}, {}
+    with ExitStack() as stack:
+        for index, destination in enumerate(destinations):
+            if destination is None:
+                identities.append(None)
+                continue
+            try:
+                path = destination.resolve()
+                try:
+                    info = path.stat()
+                    identity = ("existing", info.st_dev, info.st_ino)
+                except FileNotFoundError:
+                    ancestor = path.parent
+                    while True:
+                        try:
+                            info = ancestor.stat()
+                            break
+                        except FileNotFoundError:
+                            ancestor = ancestor.parent
+                    key = (info.st_dev, info.st_ino)
+                    if key not in probes:
+                        probes[key] = Path(
+                            stack.enter_context(
+                                tempfile.TemporaryDirectory(
+                                    prefix=".lightning-names-", dir=ancestor
+                                )
+                            )
+                        )
+                    # Mirroring names in one temporary directory detects case,
+                    # Unicode and parent-directory aliases without guessing the
+                    # volume's equivalence rules or touching actual outputs.
+                    probe = probes[key] / path.relative_to(ancestor)
+                    probe.parent.mkdir(parents=True, exist_ok=True)
+                    probe.touch(exist_ok=True)
+                    probe_info = probe.stat()
+                    identity = ("future", *key, probe_info.st_ino)
+                identities.append(identity)
+            except OSError as error:
+                errors[index] = error
+                identities.append(None)
+    return identities, errors
+
+
 def run_transcription(
     sources: Sequence[Path],
     transcriber: Callable[[Path], object],
@@ -179,11 +225,14 @@ def run_transcription(
         output_path_for(source.resolve(), normalized_output, relative_to=root)
         for source in sources
     ]
-    counts = Counter(path for path in destinations if path is not None)
+    identities, preflight_errors = _output_identities(destinations)
+    counts = Counter(identity for identity in identities if identity is not None)
     failures: list[tuple[Path, Exception]] = []
-    for source, destination in zip(sources, destinations):
+    for index, (source, destination) in enumerate(zip(sources, destinations)):
         try:
-            if destination is not None and counts[destination] > 1:
+            if index in preflight_errors:
+                raise preflight_errors[index]
+            if destination is not None and counts[identities[index]] > 1:
                 raise ValueError(
                     f"multiple inputs map to {destination}; rename inputs or use stdout"
                 )
