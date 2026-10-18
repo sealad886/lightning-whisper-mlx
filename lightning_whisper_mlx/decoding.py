@@ -1,16 +1,35 @@
 # Copyright © 2023 Apple Inc.
 
 import zlib
+from functools import lru_cache
+from types import SimpleNamespace
 from dataclasses import dataclass, field, replace
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_map
 
 from .audio import CHUNK_LENGTH
+from .beam import BeamSearchDecoder
+from .speculative import (
+    AssistantSpeculativeDecoder,
+    MTPSpeculativeDecoder,
+    SpeculativeOptions,
+    validate_speculative_options,
+)
 from .tokenizer import Tokenizer, get_tokenizer
+
+if TYPE_CHECKING:
+    from .whisper import Whisper
 
 
 def compression_ratio(text) -> float:
@@ -20,7 +39,7 @@ def compression_ratio(text) -> float:
 
 def detect_language(
     model: "Whisper", mel: mx.array, tokenizer: Tokenizer = None
-) -> Tuple[mx.array, List[dict]]:
+) -> Tuple[mx.array, Union[Dict[str, float], List[Dict[str, float]]]]:
     """
     Detect the spoken language in the audio, and return them as list of strings, along with the ids
     of the most probable language tokens and the probability distribution over all language tokens.
@@ -51,7 +70,7 @@ def detect_language(
 
     # skip encoder forward pass if already-encoded audio features were given
     if mel.shape[-2:] != (model.dims.n_audio_ctx, model.dims.n_audio_state):
-        mel = model.encoder(mel)
+        mel = model.embed_audio(mel)
 
     # forward pass using a single token, startoftranscript
     n_audio = mel.shape[0]
@@ -114,6 +133,16 @@ class DecodingOptions:
 
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
+    pipeline: bool = False  # optional bounded one-step scheduling experiment
+
+    # lossless speculative decoding; disabled by default
+    speculative_mode: str = "none"
+    lookahead: int = 2
+    assistant_model: object = None
+    assistant_quant: Optional[str] = None
+    mtp_checkpoint: Optional[str] = None
+    mtp_head: object = None
+    speculative_batch_policy: str = "lockstep"
 
 
 @dataclass(frozen=True)
@@ -134,6 +163,7 @@ class Inference:
         self.model: "Whisper" = model
         self.initial_token_length = initial_token_length
         self.kv_cache = None
+        self.last_hidden = None
 
     def logits(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
         """Perform a forward pass on the decoder and return per-token logits"""
@@ -141,19 +171,158 @@ class Inference:
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
 
-        logits, self.kv_cache, _ = self.model.decoder(
-            tokens, audio_features, kv_cache=self.kv_cache
+        return self.forward_block(tokens, audio_features)
+
+    def prefill(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
+        """Run the initial prompt without reducing it to its final token."""
+        if self.kv_cache is not None:
+            raise RuntimeError("prefill requires an empty inference cache")
+        return self.forward_block(tokens, audio_features)
+
+    def forward_one(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
+        """Decode one token against the current cache."""
+        if tokens.shape[-1] != 1:
+            raise ValueError("forward_one expects exactly one token")
+        return self.forward_block(tokens, audio_features)
+
+    def forward_block(self, tokens: mx.array, audio_features: mx.array) -> mx.array:
+        """Queue cached tokens with the same arithmetic as sequential decoding.
+
+        Multi-row fp16 matmuls produce different logits/cache values from the
+        single-row target path. Queue single-token graphs without intermediate
+        evaluation so proposal verification preserves the target's arithmetic.
+        Initial prompt prefill remains one causal decoder call.
+        """
+        if self.kv_cache is not None and tokens.shape[-1] > 1:
+            return mx.concatenate(
+                [
+                    self.forward_one(tokens[:, index : index + 1], audio_features)
+                    for index in range(tokens.shape[-1])
+                ],
+                axis=1,
+            )
+        compiled = getattr(self.model, "_compiled_decoder", None)
+        if compiled is not None and self.kv_cache is not None:
+            offset = self.cache_length
+            end = offset + tokens.shape[-1]
+            for cache, _ in self.kv_cache:
+                cache.ensure_capacity(end)
+            logits, state, self.last_hidden = compiled(
+                tokens, audio_features, self.cache_state, mx.array(offset)
+            )
+            for (cache, _), (buffers, _) in zip(self.kv_cache, state):
+                cache.keys, cache.values = buffers
+                cache.offset = end
+            return logits.astype(mx.float32)
+        logits, self.kv_cache, _, self.last_hidden = self.model.decoder(
+            tokens, audio_features, kv_cache=self.kv_cache, return_hidden=True
         )
         return logits.astype(mx.float32)
+
+    def sample_next(self, tokens, audio_features, decoder, sum_logprobs, max_steps=1):
+        """Run bounded sequential ordinary steps and sampling in one graph.
+
+        The token history includes exactly one token not yet in the cache. The
+        first prompt evaluation and its SOT probabilities stay on the ordinary
+        path; speculation continues to use the logits/hidden-state interface.
+        """
+        length = decoder._prepare_history(tokens)
+        offset = self.cache_length
+        if length != offset + 1 or self.kv_cache is None:
+            raise ValueError("joint sampling requires one uncached history token")
+        for owner, _ in self.kv_cache:
+            owner.ensure_capacity(offset + 1)
+        # Finish at a capacity boundary before growing. Growing early would make
+        # the first step attend across a different padded width than one-step
+        # execution, potentially changing its floating-point arithmetic.
+        steps = min(
+            max_steps,
+            self.kv_cache[0][0].keys.shape[1] - offset,
+            decoder.max_tokens - length,
+        )
+        sampling_key = decoder._sampling_key
+        key = (sampling_key, steps)
+        cache = self.model._joint_decoder_cache
+        compiled = cache.get(key)
+        if compiled is None:
+            filters = tuple(_filter_from_key(item) for item in sampling_key[2])
+            model_decoder = self.model.decoder
+            eot = decoder.eot
+
+            def step(token, features, state, offset, history, scores, length):
+                for index in range(steps):
+                    logits, state, _ = model_decoder(
+                        token, features, kv_cache=state, offset=offset + index
+                    )
+                    history, completed, scores = _greedy_sampling_step(
+                        logits.astype(mx.float32)[:, -1],
+                        history,
+                        scores,
+                        length + index,
+                        filters,
+                        eot,
+                    )
+                    token = mx.take(history, (length + index).reshape(1), axis=1)
+                return history, state, completed, scores
+
+            compiled = mx.compile(step)
+            if len(cache) >= 16:
+                cache.pop(next(iter(cache)))
+            cache[key] = compiled
+        end = offset + steps
+        history, state, completed, sum_logprobs = compiled(
+            tokens[:, -1:],
+            audio_features,
+            self.cache_state,
+            mx.array(offset),
+            decoder._tokens,
+            sum_logprobs,
+            mx.array(length),
+        )
+        for (owner, _), (buffers, _) in zip(self.kv_cache, state):
+            owner.keys, owner.values = buffers
+            owner.offset = end
+        self.last_hidden = None
+        decoder._tokens = history
+        decoder._length = length + steps
+        return history[:, : length + steps], completed, sum_logprobs
+
+    @property
+    def cache_length(self) -> int:
+        if not self.kv_cache or self.kv_cache[0] is None:
+            return 0
+        self_kv = self.kv_cache[0][0]
+        return 0 if self_kv is None else self_kv.offset
+
+    def truncate(self, length: int):
+        """Drop uncommitted self-attention cache entries."""
+        if length < 0 or length > self.cache_length:
+            raise ValueError("cache truncation length is outside the current cache")
+        if self.kv_cache is None:
+            if length:
+                raise ValueError("cannot retain entries in an empty cache")
+            return
+
+        for layer_cache in self.kv_cache:
+            layer_cache[0].truncate(length)
+
+    @property
+    def cache_state(self):
+        return [(kv.state, cross) for kv, cross in self.kv_cache or []]
 
     def rearrange_kv_cache(self, source_indices):
         """Update the key-value cache according to the updated beams"""
         # update the key/value cache to contain the selected sequences
         if source_indices != list(range(len(source_indices))):
-            self.kv_cache = tree_map(lambda x: x[source_indices], self.kv_cache)
+            reordered = []
+            for kv, cross in self.kv_cache:
+                kv.reorder(source_indices)
+                reordered.append((kv, tuple(x[source_indices] for x in cross)))
+            self.kv_cache = reordered
 
     def reset(self):
         self.kv_cache = None
+        self.last_hidden = None
 
 
 class SequenceRanker:
@@ -181,7 +350,7 @@ class MaximumLikelihoodRanker(SequenceRanker):
             result = []
             for logprob, length in zip(logprobs, lengths):
                 if self.length_penalty is None:
-                    penalty = length
+                    penalty = max(1, length)
                 else:
                     # from the Google NMT paper
                     penalty = ((5 + length) / 6) ** self.length_penalty
@@ -252,145 +421,240 @@ class TokenDecoder:
         raise NotImplementedError
 
 
+def _greedy_transition(logits, last_tokens, sum_logprobs, temperature, eot):
+    """Shared numerical selection/scoring semantics for eager and compiled paths."""
+    next_tokens = (
+        logits.argmax(axis=-1)
+        if temperature == 0
+        else mx.random.categorical(logits=logits / temperature)
+    )
+    logits = logits.astype(mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    current = logprobs[mx.arange(logprobs.shape[0]), next_tokens]
+    ended = last_tokens == eot
+    # An ended row can have every logit filtered. Do not multiply NaN/-inf by
+    # zero: its accumulated probability must remain unchanged.
+    scores = sum_logprobs + mx.where(ended, 0.0, current)
+    next_tokens = mx.where(ended, eot, next_tokens)
+    return next_tokens, mx.all(next_tokens == eot), scores
+
+
 class GreedyDecoder(TokenDecoder):
-    def __init__(self, temperature: float, eot: int):
+    def __init__(self, temperature: float, eot: int, max_tokens: int = 449):
         self.temperature = temperature
         self.eot = eot
+        self.max_tokens = max_tokens
+        self._compiled_sampler = None
+        self._sampling_key = None
+        self.reset()
 
-    def update(
-        self, tokens: mx.array, logits: mx.array, sum_logprobs: mx.array
-    ) -> Tuple[mx.array, bool, mx.array]:
-        if self.temperature == 0:
-            next_tokens = logits.argmax(axis=-1)
+    def reset(self):
+        self._tokens = None
+        self._length = None
+
+    @property
+    def uses_compiled_filters(self):
+        return self._compiled_sampler is not None
+
+    def configure_sampling(self, filters):
+        if self.temperature != 0:
+            raise ValueError("compiled sampling requires temperature=0")
+        self._sampling_key = (
+            self.eot,
+            self.max_tokens,
+            tuple(f.cache_key for f in filters),
+        )
+        self._compiled_sampler = _compiled_greedy_sampler(*self._sampling_key)
+
+    def _prepare_history(self, tokens):
+        length = tokens.shape[-1]
+        if tokens.ndim != 2 or not length or length >= self.max_tokens:
+            raise ValueError("token history is empty or exceeds decoder context")
+        if self._length is not None and self._length != length:
+            raise ValueError("token history length changed without resetting decoder")
+        if self._tokens is None:
+            self._tokens = mx.zeros(
+                (tokens.shape[0], self.max_tokens), dtype=tokens.dtype
+            )
+            self._tokens = mx.slice_update(self._tokens, tokens, mx.array(0), axes=(1,))
+        elif self._tokens.shape[0] != tokens.shape[0]:
+            raise ValueError("token batch changed without resetting decoder")
+        return length
+
+    def update(self, tokens, logits, sum_logprobs):
+        length = self._prepare_history(tokens)
+        if self._compiled_sampler is not None:
+            self._tokens, completed, sum_logprobs = self._compiled_sampler(
+                logits, self._tokens, sum_logprobs, mx.array(length)
+            )
         else:
-            next_tokens = mx.random.categorical(logits=logits / self.temperature)
+            next_tokens, completed, sum_logprobs = _greedy_transition(
+                logits, tokens[:, -1], sum_logprobs, self.temperature, self.eot
+            )
+            self._tokens[:, length : length + 1] = next_tokens[:, None]
+        self._length = length + 1
+        return self._tokens[:, : length + 1], completed, sum_logprobs
 
-        next_tokens = mx.argmax(logits, axis=-1)
-        logits = logits.astype(mx.float32)
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-
-        current_logprobs = logprobs[mx.arange(logprobs.shape[0]), next_tokens]
-        sum_logprobs += current_logprobs * (tokens[:, -1] != self.eot)
-
-        eot_mask = tokens[:, -1] == self.eot
-        next_tokens = next_tokens * (1 - eot_mask) + self.eot * eot_mask
-        tokens = mx.concatenate([tokens, next_tokens[:, None]], axis=-1)
-
-        completed = mx.all(tokens[:, -1] == self.eot)
-        return tokens, completed, sum_logprobs
-
-    def finalize(self, tokens: mx.array, sum_logprobs: mx.array):
-        # make sure each sequence has at least one EOT token at the end
+    def finalize(self, tokens, sum_logprobs):
         tokens = mx.pad(tokens, [(0, 0), (0, 0), (0, 1)], constant_values=self.eot)
         return tokens, sum_logprobs.tolist()
 
 
 class LogitFilter:
-    def apply(self, logits: mx.array, tokens: mx.array) -> mx.array:
-        """Apply any filtering or masking to logits
-
-        Parameters
-        ----------
-        logits : mx.array, shape = (n_batch, vocab_size)
-            per-token logits of the probability distribution at the current step
-
-        tokens : mx.array, shape = (n_batch, current_sequence_length)
-            all tokens in the context so far, including the prefix and sot_sequence tokens
-
-        """
+    def apply(self, logits, tokens, logical_length=None):
+        """Filter logits using only token positions below logical_length."""
         raise NotImplementedError
 
 
 class SuppressBlank(LogitFilter):
-    def __init__(self, tokenizer: Tokenizer, sample_begin: int, n_vocab: int):
+    def __init__(self, tokenizer, sample_begin, n_vocab):
         self.sample_begin = sample_begin
+        space_tokens = tuple(tokenizer.encode(" "))
+        self.cache_key = ("blank", sample_begin, n_vocab, space_tokens, tokenizer.eot)
         mask = np.zeros(n_vocab, np.float32)
-        mask[tokenizer.encode(" ") + [tokenizer.eot]] = -np.inf
+        mask[list(space_tokens) + [tokenizer.eot]] = -np.inf
         self.mask = mx.array(mask)
 
-    def apply(self, logits: mx.array, tokens: mx.array) -> mx.array:
-        if tokens.shape[1] == self.sample_begin:
-            return logits + self.mask
-        return logits
+    def apply(self, logits, tokens, logical_length=None):
+        length = tokens.shape[1] if logical_length is None else logical_length
+        return mx.where(length == self.sample_begin, logits + self.mask, logits)
 
 
 class SuppressTokens(LogitFilter):
-    def __init__(self, suppress_tokens: Sequence[int], n_vocab: int):
+    def __init__(self, suppress_tokens, n_vocab):
+        suppressed = tuple(sorted(set(suppress_tokens)))
+        self.cache_key = ("tokens", suppressed, n_vocab)
         mask = np.zeros(n_vocab, np.float32)
-        mask[list(suppress_tokens)] = -np.inf
+        mask[list(suppressed)] = -np.inf
         self.mask = mx.array(mask)
 
-    def apply(self, logits: mx.array, tokens: mx.array) -> mx.array:
+    def apply(self, logits, tokens, logical_length=None):
         return logits + self.mask
 
 
 class ApplyTimestampRules(LogitFilter):
-    def __init__(
-        self,
-        tokenizer: Tokenizer,
-        sample_begin: int,
-        max_initial_timestamp_index: Optional[int],
-    ):
+    def __init__(self, tokenizer, sample_begin, max_initial_timestamp_index):
         self.tokenizer = tokenizer
         self.sample_begin = sample_begin
         self.max_initial_timestamp_index = max_initial_timestamp_index
+        self.cache_key = (
+            "timestamps",
+            sample_begin,
+            max_initial_timestamp_index,
+            tokenizer.eot,
+            tokenizer.no_timestamps,
+            tokenizer.timestamp_begin,
+        )
 
-    def apply(self, logits: mx.array, tokens: mx.array) -> mx.array:
-        mask = np.zeros(logits.shape, np.float32)
-        # suppress <|notimestamps|> which is handled by without_timestamps
+    def apply(self, logits, tokens, logical_length=None):
+        length = tokens.shape[1] if logical_length is None else logical_length
+        if isinstance(length, int) and not 0 < length <= tokens.shape[1]:
+            raise ValueError("logical token length is outside the supplied buffer")
+        length = mx.array(length)
+        token_ids = mx.arange(logits.shape[-1])[None, :]
+        forbidden = mx.zeros(logits.shape, dtype=mx.bool_)
         if self.tokenizer.no_timestamps is not None:
-            mask[:, self.tokenizer.no_timestamps] = -np.inf
-
-        # timestamps have to appear in pairs, except directly before EOT; mask logits accordingly
-        for k in range(tokens.shape[0]):
-            sampled_tokens = tokens[k, self.sample_begin :]
-            seq = sampled_tokens.tolist()
-            last_was_timestamp = (
-                len(seq) >= 1 and seq[-1] >= self.tokenizer.timestamp_begin
+            forbidden = forbidden | (token_ids == self.tokenizer.no_timestamps)
+        sampled_length = length - self.sample_begin
+        positions = mx.arange(tokens.shape[1])[None, :]
+        valid = (positions >= self.sample_begin) & (positions < length)
+        is_timestamp = valid & (tokens >= self.tokenizer.timestamp_begin)
+        last_token = mx.take(tokens, mx.array(length - 1).reshape(1), axis=1)
+        penultimate_token = mx.take(
+            tokens, mx.maximum(mx.array(length - 2), 0).reshape(1), axis=1
+        )
+        has_samples = sampled_length > 0
+        last_was_timestamp = has_samples & (
+            last_token >= self.tokenizer.timestamp_begin
+        )
+        penultimate_was_timestamp = (sampled_length < 2) | (
+            penultimate_token >= self.tokenizer.timestamp_begin
+        )
+        forbidden = (
+            forbidden
+            | (
+                has_samples
+                & last_was_timestamp
+                & penultimate_was_timestamp
+                & (token_ids >= self.tokenizer.timestamp_begin)
             )
-            penultimate_was_timestamp = (
-                len(seq) < 2 or seq[-2] >= self.tokenizer.timestamp_begin
+            | (
+                has_samples
+                & last_was_timestamp
+                & ~penultimate_was_timestamp
+                & (token_ids < self.tokenizer.eot)
             )
-
-            if last_was_timestamp:
-                if penultimate_was_timestamp:  # has to be non-timestamp
-                    mask[k, self.tokenizer.timestamp_begin :] = -np.inf
-                else:  # cannot be normal text tokens
-                    mask[k, : self.tokenizer.eot] = -np.inf
-
-            timestamps = [
-                i for i, v in enumerate(seq) if v > self.tokenizer.timestamp_begin
-            ]
-            if len(timestamps) > 0:
-                # timestamps shouldn't decrease; forbid timestamp tokens smaller than the last
-                # also force each segment to have a nonzero length, to prevent infinite looping
-                last_timestamp = timestamps[-1]
-                if not last_timestamp or penultimate_was_timestamp:
-                    last_timestamp += 1
-                mask[k, self.tokenizer.timestamp_begin : last_timestamp] = -np.inf
-
-        if tokens.shape[1] == self.sample_begin:
-            # suppress generating non-timestamp tokens at the beginning
-            mask[:, : self.tokenizer.timestamp_begin] = -np.inf
-
-            # apply the `max_initial_timestamp` option
-            if self.max_initial_timestamp_index is not None:
-                last_allowed = (
-                    self.tokenizer.timestamp_begin + self.max_initial_timestamp_index
-                )
-                mask[:, last_allowed + 1 :] = -np.inf
-
-        # if sum of probability over timestamps is above any other token, sample timestamp
+        )
+        last_position = mx.max(
+            mx.where(is_timestamp, positions, -1), axis=-1, keepdims=True
+        )
+        last_timestamp = mx.take_along_axis(
+            tokens, mx.maximum(last_position, 0), axis=-1
+        )
+        lower_bound = last_timestamp + (~last_was_timestamp | penultimate_was_timestamp)
+        forbidden = forbidden | (
+            (last_position >= 0)
+            & (token_ids >= self.tokenizer.timestamp_begin)
+            & (token_ids < lower_bound)
+        )
+        initial = length == self.sample_begin
+        forbidden = forbidden | (initial & (token_ids < self.tokenizer.timestamp_begin))
+        if self.max_initial_timestamp_index is not None:
+            last_allowed = (
+                self.tokenizer.timestamp_begin + self.max_initial_timestamp_index
+            )
+            forbidden = forbidden | (initial & (token_ids > last_allowed))
+        logits = mx.where(forbidden, -mx.inf, logits)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        for k in range(tokens.shape[0]):
-            timestamp_logprob = logprobs[k, self.tokenizer.timestamp_begin :].logsumexp(
-                axis=-1
-            )
-            max_text_token_logprob = logprobs[k, : self.tokenizer.timestamp_begin].max()
-            if timestamp_logprob > max_text_token_logprob:
-                mask[k, : self.tokenizer.timestamp_begin] = -np.inf
+        timestamp_logprob = mx.logsumexp(
+            logprobs[:, self.tokenizer.timestamp_begin :], axis=-1, keepdims=True
+        )
+        max_text_logprob = mx.max(
+            logprobs[:, : self.tokenizer.timestamp_begin], axis=-1, keepdims=True
+        )
+        return mx.where(
+            (timestamp_logprob > max_text_logprob)
+            & (token_ids < self.tokenizer.timestamp_begin),
+            -mx.inf,
+            logits,
+        )
 
-        return logits + mx.array(mask, logits.dtype)
+
+def _filter_from_key(key):
+    kind, *values = key
+    if kind == "tokens":
+        return SuppressTokens(*values)
+    if kind == "blank":
+        sample_begin, n_vocab, space_tokens, eot = values
+        tokenizer = SimpleNamespace(encode=lambda _: list(space_tokens), eot=eot)
+        return SuppressBlank(tokenizer, sample_begin, n_vocab)
+    if kind == "timestamps":
+        sample_begin, max_initial, eot, no_timestamps, timestamp_begin = values
+        tokenizer = SimpleNamespace(
+            eot=eot, no_timestamps=no_timestamps, timestamp_begin=timestamp_begin
+        )
+        return ApplyTimestampRules(tokenizer, sample_begin, max_initial)
+    raise ValueError(f"unsupported compiled logit filter: {kind}")
+
+
+@lru_cache(maxsize=16)
+def _compiled_greedy_sampler(eot, capacity, filter_keys):
+    filters = tuple(_filter_from_key(key) for key in filter_keys)
+
+    def step(logits, buffer, scores, length):
+        return _greedy_sampling_step(logits, buffer, scores, length, filters, eot)
+
+    return mx.compile(step)
+
+
+def _greedy_sampling_step(logits, buffer, scores, length, filters, eot):
+    """Canonical pure transition shared by separate and joint compiled graphs."""
+    for logit_filter in filters:
+        logits = logit_filter.apply(logits, buffer, logical_length=length)
+    last = mx.take(buffer, (length - 1).reshape(1), axis=1).reshape(buffer.shape[0])
+    next_tokens, completed, scores = _greedy_transition(logits, last, scores, 0, eot)
+    buffer = mx.slice_update(buffer, next_tokens[:, None], length.reshape(1), axes=(1,))
+    return buffer, completed, scores
 
 
 class DecodingTask:
@@ -432,12 +696,13 @@ class DecodingTask:
 
         # decoder: implements how to select the next tokens, given the autoregressive distribution
         if options.beam_size is not None:
-            raise NotImplementedError("Beam search decoder is not yet implemented")
-            # self.decoder = BeamSearchDecoder(
-            #    options.beam_size, tokenizer.eot, self.inference, options.patience
-            # )
+            self.decoder = BeamSearchDecoder(
+                options.beam_size, tokenizer.eot, self.inference, options.patience
+            )
         else:
-            self.decoder = GreedyDecoder(options.temperature, tokenizer.eot)
+            self.decoder = GreedyDecoder(
+                options.temperature, tokenizer.eot, self.n_ctx + 1
+            )
 
         # logit filters: applies various rules to suppress or penalize certain tokens
         self.logit_filters = []
@@ -452,7 +717,7 @@ class DecodingTask:
         if not options.without_timestamps:
             precision = CHUNK_LENGTH / model.dims.n_audio_ctx  # usually 0.02 seconds
             max_initial_timestamp_index = None
-            if options.max_initial_timestamp:
+            if options.max_initial_timestamp is not None:
                 max_initial_timestamp_index = round(
                     self.options.max_initial_timestamp / precision
                 )
@@ -462,7 +727,28 @@ class DecodingTask:
                 )
             )
 
+        if (
+            getattr(model, "_compiled_decoder", None) is not None
+            and options.temperature == 0
+            and options.beam_size is None
+        ):
+            self.decoder.configure_sampling(self.logit_filters)
+
     def _verify_options(self, options: DecodingOptions) -> DecodingOptions:
+        if not np.isfinite(options.temperature) or options.temperature < 0:
+            raise ValueError("temperature must be finite and non-negative")
+        if options.sample_len is not None and (
+            not isinstance(options.sample_len, int)
+            or isinstance(options.sample_len, bool)
+            or options.sample_len < 1
+        ):
+            raise ValueError("sample_len must be a positive integer")
+        if options.beam_size is not None and options.temperature != 0:
+            raise ValueError("beam search requires temperature=0")
+        if options.best_of is not None and (
+            not isinstance(options.best_of, int) or options.best_of < 1
+        ):
+            raise ValueError("best_of must be a positive integer")
         if options.beam_size is not None and options.best_of is not None:
             raise ValueError("beam_size and best_of can't be given together")
         if options.temperature == 0:
@@ -475,10 +761,32 @@ class DecodingTask:
         ):
             raise ValueError("length_penalty (alpha) should be a value between 0 and 1")
 
+        validate_speculative_options(
+            SpeculativeOptions(
+                speculative_mode=options.speculative_mode,
+                lookahead=options.lookahead,
+                assistant_model=options.assistant_model,
+                assistant_quant=options.assistant_quant,
+                mtp_checkpoint=options.mtp_checkpoint,
+                speculative_batch_policy=options.speculative_batch_policy,
+            ),
+            temperature=options.temperature,
+        )
+
         return options
 
     def _get_initial_tokens(self) -> Tuple[int]:
+        """Fit context while retaining recent prefix before historical prompt.
+
+        Leave at least one text-context position for generation. Historical
+        prompt retains its half-context cap and yields space to the current
+        prefix when their composition overflows. ``sample_len`` remains a
+        generation upper limit, independent of available context capacity.
+        """
         tokens = list(self.sot_sequence)
+        prefix_budget = self.n_ctx - len(tokens) - 1
+        if prefix_budget < 0:
+            raise ValueError("text context must leave room for token generation")
 
         if prefix := self.options.prefix:
             prefix_tokens = (
@@ -486,9 +794,7 @@ class DecodingTask:
                 if isinstance(prefix, str)
                 else prefix
             )
-            if self.sample_len is not None:
-                max_prefix_len = self.n_ctx // 2 - self.sample_len
-                prefix_tokens = prefix_tokens[-max_prefix_len:]
+            prefix_tokens = prefix_tokens[max(0, len(prefix_tokens) - prefix_budget) :]
             tokens = tokens + prefix_tokens
 
         if prompt := self.options.prompt:
@@ -497,11 +803,16 @@ class DecodingTask:
                 if isinstance(prompt, str)
                 else prompt
             )
-            tokens = (
-                [self.tokenizer.sot_prev]
-                + prompt_tokens[-(self.n_ctx // 2 - 1) :]
-                + tokens
+            prompt_budget = min(
+                self.n_ctx // 2 - 1,
+                self.n_ctx - len(tokens) - 2,  # prompt separator and generation
             )
+            if prompt_budget > 0:
+                tokens = (
+                    [self.tokenizer.sot_prev]
+                    + prompt_tokens[max(0, len(prompt_tokens) - prompt_budget) :]
+                    + tokens
+                )
 
         return tuple(tokens)
 
@@ -535,9 +846,6 @@ class DecodingTask:
         return tuple(sorted(set(suppress_tokens)))
 
     def _get_audio_features(self, mel: mx.array):
-        if self.options.fp16:
-            mel = mel.astype(mx.float16)
-
         if mel.shape[-2:] == (
             self.model.dims.n_audio_ctx,
             self.model.dims.n_audio_state,
@@ -545,7 +853,7 @@ class DecodingTask:
             # encoded audio features are given; skip audio encoding
             audio_features = mel
         else:
-            audio_features = self.model.encoder(mel)
+            audio_features = self.model.embed_audio(mel)
 
         if audio_features.dtype != (mx.float16 if self.options.fp16 else mx.float32):
             raise TypeError(
@@ -569,51 +877,157 @@ class DecodingTask:
 
         return languages, lang_probs
 
-    def _main_loop(self, audio_features: mx.array, tokens: mx.array):
+    def _main_loop(
+        self,
+        audio_features: mx.array,
+        tokens: mx.array,
+        assistant_audio_features: Optional[mx.array] = None,
+    ):
+        if self.options.speculative_mode == "mtp":
+            if tokens.shape[0] != 1:
+                raise ValueError(
+                    "MTP speculative decoding currently requires batch_size=1"
+                )
+            if self.options.mtp_head is None:
+                raise ValueError("mtp mode requires a loaded MTP head")
+            prefix = tokens[0].tolist()
+            speculative = MTPSpeculativeDecoder(
+                model=self.model,
+                head=self.options.mtp_head,
+                audio_features=audio_features,
+                prefix=prefix,
+                lookahead=self.options.lookahead,
+                eot=self.tokenizer.eot,
+                logit_filters=self.logit_filters,
+            )
+            no_speech = [np.nan]
+            if self.tokenizer.no_speech is not None:
+                no_speech = [
+                    float(
+                        mx.softmax(
+                            speculative.verifier.next_logits[:, self.sot_index], axis=-1
+                        )[0, self.tokenizer.no_speech].item()
+                    )
+                ]
+            generated, sum_logprob = speculative.decode(self.sample_len)
+            return (
+                mx.array([prefix + generated]),
+                mx.array([sum_logprob]),
+                no_speech,
+            )
+
+        if self.options.speculative_mode == "assistant":
+            if tokens.shape[0] != 1:
+                raise ValueError(
+                    "assistant speculative decoding currently requires batch_size=1"
+                )
+            if assistant_audio_features is None:
+                raise ValueError("assistant audio features are required")
+            prefix = tokens[0].tolist()
+            speculative = AssistantSpeculativeDecoder(
+                target_model=self.model,
+                assistant_model=self.options.assistant_model,
+                audio_features=audio_features,
+                assistant_audio_features=assistant_audio_features,
+                prefix=prefix,
+                lookahead=self.options.lookahead,
+                eot=self.tokenizer.eot,
+                logit_filters=self.logit_filters,
+            )
+            no_speech = [np.nan]
+            if self.tokenizer.no_speech is not None:
+                no_speech = [
+                    float(
+                        mx.softmax(
+                            speculative.verifier.next_logits[:, self.sot_index], axis=-1
+                        )[0, self.tokenizer.no_speech].item()
+                    )
+                ]
+            generated, sum_logprob = speculative.decode(self.sample_len)
+            output = mx.array([prefix + generated])
+            return output, mx.array([sum_logprob]), no_speech
+
         n_batch = tokens.shape[0]
         sum_logprobs: mx.array = mx.zeros(n_batch)
         no_speech_probs = [np.nan] * n_batch
+        joint = (
+            getattr(self.model, "_joint_decoding", False)
+            and getattr(self.decoder, "uses_compiled_filters", False)
+            and not self.options.pipeline
+        )
 
         try:
-            for i in range(self.sample_len):
-                logits = self.inference.logits(tokens, audio_features)
-
-                if (
-                    i == 0 and self.tokenizer.no_speech is not None
-                ):  # save no_speech_probs
-                    probs_at_sot = mx.softmax(
-                        logits[:, self.sot_index].astype(mx.float32), axis=-1
+            logits = self.inference.logits(tokens, audio_features)
+            i = 0
+            while i < self.sample_len:
+                previous_length = tokens.shape[-1]
+                if i and joint:
+                    tokens, completed, sum_logprobs = self.inference.sample_next(
+                        tokens,
+                        audio_features,
+                        self.decoder,
+                        sum_logprobs,
+                        max_steps=min(
+                            self.model._decode_chunk_size,
+                            self.sample_len - i,
+                            self.n_ctx + 1 - previous_length,
+                        ),
                     )
-                    no_speech_probs = probs_at_sot[:, self.tokenizer.no_speech].tolist()
+                else:
+                    if i == 0 and self.tokenizer.no_speech is not None:
+                        probs_at_sot = mx.softmax(
+                            logits[:, self.sot_index].astype(mx.float32), axis=-1
+                        )
+                        no_speech_probs = probs_at_sot[
+                            :, self.tokenizer.no_speech
+                        ].tolist()
+                    logits = logits[:, -1]
+                    if not getattr(self.decoder, "uses_compiled_filters", False):
+                        for logit_filter in self.logit_filters:
+                            logits = logit_filter.apply(logits, tokens)
+                    tokens, completed, sum_logprobs = self.decoder.update(
+                        tokens, logits, sum_logprobs
+                    )
 
-                # now we need to consider the logits at the last token only
-                logits = logits[:, -1]
-
-                # apply the logit filters, e.g. for suppressing or applying penalty to
-                for logit_filter in self.logit_filters:
-                    logits = logit_filter.apply(logits, tokens)
-
-                # expand the tokens tensor with the selected next tokens
-                tokens, completed, sum_logprobs = self.decoder.update(
-                    tokens, logits, sum_logprobs
-                )
-
-                if completed or tokens.shape[-1] > self.n_ctx:
+                i += tokens.shape[-1] - previous_length
+                has_next = i < self.sample_len and tokens.shape[-1] <= self.n_ctx
+                next_logits = None
+                if has_next and self.options.pipeline:
+                    # Schedule bounded work while Python observes the previous
+                    # completion flag. EOT rows are already masked by the decoder.
+                    next_logits = self.inference.logits(tokens, audio_features)
+                    mx.async_eval(next_logits, sum_logprobs, tokens)
+                if completed or not has_next:
                     break
+                if joint:
+                    logits = None
+                else:
+                    logits = (
+                        self.inference.logits(tokens, audio_features)
+                        if next_logits is None
+                        else next_logits
+                    )
         finally:
             self.inference.reset()
 
         return tokens, sum_logprobs, no_speech_probs
 
-    def run(self, mel: mx.array) -> List[DecodingResult]:
+    def run(self, mel: mx.array, audio_features=None) -> List[DecodingResult]:
         self.decoder.reset()
+        if self.options.fp16:
+            mel = mel.astype(mx.float16)
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
 
         mel = mx.repeat(mel, repeats=1, axis=0)
         n_audio *= 1
 
-        audio_features: mx.array = self._get_audio_features(mel)  # encoder forward pass
+        assistant_audio_features = None
+        if self.options.speculative_mode == "assistant":
+            assistant_audio_features = self.options.assistant_model.encoder(mel)
+        audio_features = self._get_audio_features(
+            mel if audio_features is None else audio_features
+        )
         tokens: np.array = np.array(self.initial_tokens)
         tokens = np.broadcast_to(tokens, (n_audio, len(self.initial_tokens))).copy()
 
@@ -632,16 +1046,13 @@ class DecodingTask:
         # repeat tokens by the group size, for beam search or best-of-n sampling
         tokens = mx.array(tokens)
         if self.n_group > 1:
-            tokens = tokens[:, None, :]
-            tokens = mx.broadcast_to(
-                tokens, [n_audio, self.n_group, len(self.initial_tokens)]
-            )
-            tokens = tokens.reshape(
-                tokens, (n_audio * self.n_group, len(self.initial_tokens))
-            )
+            tokens = mx.repeat(tokens, self.n_group, axis=0)
+            audio_features = mx.repeat(audio_features, self.n_group, axis=0)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
+        tokens, sum_logprobs, no_speech_probs = self._main_loop(
+            audio_features, tokens, assistant_audio_features
+        )
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]
@@ -698,6 +1109,8 @@ def decode(
     model: "Whisper",
     mel: mx.array,
     options: DecodingOptions = DecodingOptions(),
+    *,
+    audio_features=None,
     **kwargs,
 ) -> Union[DecodingResult, List[DecodingResult]]:
     """
@@ -725,5 +1138,7 @@ def decode(
     if kwargs:
         options = replace(options, **kwargs)
 
-    result = DecodingTask(model, options).run(mel)
+    if audio_features is not None and single and audio_features.ndim == 2:
+        audio_features = audio_features[None]
+    result = DecodingTask(model, options).run(mel, audio_features=audio_features)
     return result[0] if single else result

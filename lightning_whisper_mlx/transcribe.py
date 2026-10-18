@@ -1,13 +1,13 @@
 # Copyright © 2023 Apple Inc.
 
 import sys
+import threading
 import warnings
 from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 import numpy as np
-import tqdm
-import time
+from dataclasses import dataclass
 
 from .audio import (
     FRAMES_PER_SECOND,
@@ -15,11 +15,14 @@ from .audio import (
     N_FRAMES,
     N_SAMPLES,
     SAMPLE_RATE,
-    log_mel_spectrogram,
+    log_mel_spectrogram_from_prepared,
     pad_or_trim,
+    prepare_audio,
+    is_constant_audio,
 )
 from .decoding import DecodingOptions, DecodingResult
-from .load_models import load_model
+from .load_models import load_model, model_artifact_identity
+from .mtp import fingerprint_tokenizer, load_mtp_head
 from .timing import add_word_timestamps
 from .tokenizer import LANGUAGES, get_tokenizer
 
@@ -51,23 +54,163 @@ def _get_end(segments: List[dict]) -> Optional[float]:
 class ModelHolder:
     model = None
     model_path = None
+    model_identity = None
+    _lock = threading.RLock()
 
     @classmethod
     def get_model(cls, model_path: str, dtype: mx.Dtype):
-        if cls.model is None or model_path != cls.model_path:
-            cls.model = load_model(model_path, dtype=dtype)
-            cls.model_path = model_path
-        return cls.model
+        with cls._lock:
+            identity = (model_artifact_identity(model_path), str(dtype))
+            if cls.model is None or identity != cls.model_identity:
+                model = load_model(model_path, dtype=dtype)
+                identity = (model_artifact_identity(model_path), str(dtype))
+                cls.model = model
+                cls.model_path = model_path
+                cls.model_identity = identity
+            return cls.model
+
+
+@dataclass
+class _DecodeRequest:
+    model: object
+    mel: mx.array
+    options: DecodingOptions
+    audio_features: object = None
+
+
+def _run_transcriptions(jobs, batch_size):
+    """Cooperatively batch compatible windows without sharing transcript state."""
+    outputs = [None] * len(jobs)
+    pending = {}
+
+    def advance(index, value=None, initial=False):
+        try:
+            pending[index] = next(jobs[index]) if initial else jobs[index].send(value)
+        except StopIteration as done:
+            outputs[index] = done.value
+            pending.pop(index, None)
+
+    for index in range(len(jobs)):
+        advance(index, initial=True)
+    try:
+        while pending:
+            groups = []
+            for index, request in pending.items():
+                # Exact option equality preserves per-record prompts, language,
+                # filters and fallback. Speculation remains explicitly single-row.
+                key = (
+                    id(request.model),
+                    repr(request.options),
+                    request.audio_features is not None,
+                )
+                width = request.mel.shape[0]
+                for group in groups:
+                    if (
+                        group[0] == key
+                        and group[1] + width <= batch_size
+                        and request.options.speculative_mode == "none"
+                    ):
+                        group[1] += width
+                        group[2].append((index, request))
+                        break
+                else:
+                    groups.append([key, width, [(index, request)]])
+            # Complete the whole wave before advancing a job, bounding model work
+            # and keeping pending requests stable while iterating the groups.
+            completed = []
+            for _, _, group in groups:
+                first = group[0][1]
+                mel = mx.concatenate([r.mel for _, r in group], axis=0)
+                features = None
+                if first.audio_features is not None:
+                    features = mx.concatenate(
+                        [r.audio_features for _, r in group], axis=0
+                    )
+                results = first.model.decode(
+                    mel, first.options, audio_features=features
+                )
+                if len(results) != mel.shape[0]:
+                    raise RuntimeError(
+                        "decoder result count differs from scheduled rows"
+                    )
+                offset = 0
+                for index, request in group:
+                    end = offset + request.mel.shape[0]
+                    completed.append((index, results[offset:end]))
+                    offset = end
+            for index, results in completed:
+                advance(index, results)
+    finally:
+        for job in jobs:
+            job.close()
+    return outputs
 
 
 def transcribe_audio(
+    audio,
+    *,
+    path_or_hf_repo="mlx-community/whisper-tiny",
+    model_instance=None,
+    **options,
+):
+    """Transcribe one recording using an optional explicitly resident model."""
+    return transcribe_many_audio(
+        [audio],
+        path_or_hf_repo=path_or_hf_repo,
+        model_instance=model_instance,
+        **options,
+    )[0]
+
+
+def transcribe_many_audio(
+    audios,
+    *,
+    path_or_hf_repo="mlx-community/whisper-tiny",
+    model_instance=None,
+    batch_size=6,
+    **options,
+):
+    """Transcribe a bounded batch of independent recordings, preserving input order.
+
+    Each recording retains its own prompts, seek, language and fallback state.
+    Compatible windows share model execution; incompatible requests run separately.
+    """
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size < 1
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    audios = list(audios)
+    if not audios:
+        return []
+    dtype = mx.float16 if options.get("fp16", True) else mx.float32
+    model = model_instance or ModelHolder.get_model(path_or_hf_repo, dtype)
+    outputs = []
+    # Bound both active window tensors and preprocessed recording residency.
+    for start in range(0, len(audios), batch_size):
+        jobs = [
+            _transcribe_audio(
+                audio,
+                path_or_hf_repo=path_or_hf_repo,
+                model_instance=model,
+                batch_size=batch_size,
+                **options,
+            )
+            for audio in audios[start : start + batch_size]
+        ]
+        outputs.extend(_run_transcriptions(jobs, batch_size))
+    return outputs
+
+
+def _transcribe_audio(
     audio: Union[str, np.ndarray, mx.array],
     *,
     path_or_hf_repo: str = "mlx-community/whisper-tiny",
     verbose: Optional[bool] = None,
     temperature: Union[float, Tuple[float, ...]] = (0.0, 1.0),
     compression_ratio_threshold: Optional[float] = 2.4,
-    logprob_threshold: Optional[float] = -1, 
+    logprob_threshold: Optional[float] = -1,
     no_speech_threshold: Optional[float] = 0.6,
     condition_on_previous_text: bool = True,
     initial_prompt: Optional[str] = None,
@@ -76,7 +219,8 @@ def transcribe_audio(
     append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
     clip_timestamps: Union[str, List[float]] = "0",
     hallucination_silence_threshold: Optional[float] = None,
-    batch_size: 6,
+    batch_size: int = 6,
+    model_instance=None,
     **decode_options,
 ):
     """
@@ -145,12 +289,39 @@ def transcribe_audio(
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
 
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size < 1
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    temperatures = (
+        [temperature] if isinstance(temperature, (int, float)) else list(temperature)
+    )
+    if not temperatures or any(not np.isfinite(t) or t < 0 for t in temperatures):
+        raise ValueError("temperature must contain finite, non-negative values")
     dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
-    model = ModelHolder.get_model(path_or_hf_repo, dtype)
+    model = model_instance or ModelHolder.get_model(path_or_hf_repo, dtype)
+    if decode_options.get("task", "transcribe") == "translate" and not getattr(
+        model, "supports_translation", True
+    ):
+        raise ValueError("selected model does not support translation")
 
-    # Pad 30-seconds of silence to the input audio, for slicing
-    mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
+    assistant = None
+    if decode_options.get("speculative_mode") == "assistant":
+        assistant = decode_options.get("assistant_model")
+        if isinstance(assistant, str):
+            assistant = load_model(assistant, dtype=dtype)
+            decode_options["assistant_model"] = assistant
+
+    # Decode file inputs once. The same original PCM supplies both mel frames
+    # and the exact no-acoustic-information proof for each requested window.
+    audio = prepare_audio(audio)
+    mel = log_mel_spectrogram_from_prepared(
+        audio, n_mels=model.dims.n_mels, padding=N_SAMPLES
+    )
     content_frames = mel.shape[-2] - N_FRAMES
+    content_duration = content_frames * HOP_LENGTH / SAMPLE_RATE
 
     if verbose:
         system_encoding = sys.getdefaultencoding()
@@ -161,6 +332,7 @@ def transcribe_audio(
         else:
             make_safe = lambda x: x
 
+    detected_features = None
     if decode_options.get("language", None) is None:
         if not model.is_multilingual:
             decode_options["language"] = "en"
@@ -171,7 +343,8 @@ def transcribe_audio(
                     "Use the `language` decoding option to specify the language"
                 )
             mel_segment = pad_or_trim(mel, N_FRAMES, axis=-2).astype(dtype)
-            _, probs = model.detect_language(mel_segment)
+            detected_features = model.embed_audio(mel_segment[None])[0]
+            _, probs = model.detect_language(detected_features)
             decode_options["language"] = max(probs, key=probs.get)
             if verbose is not None:
                 print(
@@ -187,62 +360,113 @@ def transcribe_audio(
         task=task,
     )
 
+    if assistant is not None:
+        if assistant.dims.n_vocab != model.dims.n_vocab:
+            raise ValueError("assistant and target models must share vocabulary size")
+        if assistant.dims.n_mels != model.dims.n_mels:
+            raise ValueError("assistant and target models must share mel bin count")
+        if assistant.dims.n_text_ctx < model.dims.n_text_ctx:
+            raise ValueError("assistant text context must cover target context")
+        assistant_tokenizer = get_tokenizer(
+            assistant.is_multilingual,
+            num_languages=assistant.num_languages,
+            language=language,
+            task=task,
+        )
+        if fingerprint_tokenizer(assistant_tokenizer) != fingerprint_tokenizer(
+            tokenizer
+        ):
+            raise ValueError("assistant and target tokenizers are incompatible")
+    elif decode_options.get("speculative_mode") == "mtp":
+        checkpoint = decode_options.get("mtp_checkpoint")
+        if not checkpoint:
+            raise ValueError("mtp mode requires mtp_checkpoint")
+        head, _ = load_mtp_head(
+            checkpoint,
+            decoder_hidden_size=model.dims.n_text_state,
+            vocabulary_size=model.dims.n_vocab,
+            base_model_fingerprint=getattr(model, "_checkpoint_fingerprint", ""),
+            tokenizer_fingerprint=fingerprint_tokenizer(tokenizer),
+        )
+        decode_options["mtp_head"] = head
+
     if isinstance(clip_timestamps, str):
         clip_timestamps = [
             float(ts) for ts in (clip_timestamps.split(",") if clip_timestamps else [])
         ]
+    if any(not np.isfinite(ts) or ts < 0 for ts in clip_timestamps):
+        raise ValueError("clip timestamps must be finite and non-negative")
     seek_points: List[int] = [round(ts * FRAMES_PER_SECOND) for ts in clip_timestamps]
     if len(seek_points) == 0:
         seek_points.append(0)
     if len(seek_points) % 2 == 1:
         seek_points.append(content_frames)
     seek_clips: List[Tuple[int, int]] = list(zip(seek_points[::2], seek_points[1::2]))
+    if any(start > end for start, end in seek_clips):
+        raise ValueError("clip start must not exceed clip end")
+    seek_clips = [
+        (min(start, content_frames), min(end, content_frames))
+        for start, end in seek_clips
+    ]
 
     punctuation = "\"'“¿([{-\"'.。,，!！?？:：”)]}、"
 
     if word_timestamps and task == "translate":
         warnings.warn("Word-level timestamps on translations may not be reliable.")
-    
-    def decode_process(segment_batch, t):
+
+    def decode_process(segment_batch, t, features):
         kwargs = {**decode_options}
+        if t > 0:
+            kwargs.pop("beam_size", None)
+            kwargs.pop("patience", None)
+        else:
+            kwargs.pop("best_of", None)
+        if t != 0 and kwargs.get("speculative_mode") != "none":
+            kwargs.update(
+                speculative_mode="none",
+                assistant_model=None,
+                assistant_quant=None,
+                mtp_checkpoint=None,
+                mtp_head=None,
+            )
         options = DecodingOptions(**kwargs, temperature=t)
-        decode_results = model.decode(segment_batch, options)
+        decode_results = yield _DecodeRequest(model, segment_batch, options, features)
         return decode_results
 
-    def decode_with_fallback(segment_batch: mx.array) -> DecodingResult:
-        decode_results = decode_process(segment_batch, 0.0)
-        final_decode = []
-
-        for i, decode_result in enumerate(decode_results):
-            segment = segment_batch[i:i+1, :, :]  
-            needs_fallback = False
-            if (
-                compression_ratio_threshold is not None
-                and decode_result.compression_ratio > compression_ratio_threshold
-            ):
-                needs_fallback = True
-
-            if (
-                logprob_threshold is not None
-                and decode_result.avg_logprob < logprob_threshold
-            ):
-                needs_fallback = True  
-
-            if (
-                no_speech_threshold is not None
-                and decode_result.no_speech_prob > no_speech_threshold
-            ):
-                needs_fallback = False  
-
-            if needs_fallback:
-                final_decode.append(decode_process(segment, 1.0)[0])
-            else:
-                final_decode.append(decode_result)
-
+    def decode_with_fallback(segment_batch: mx.array, features=None):
+        final_decode = [None] * segment_batch.shape[0]
+        pending = list(range(segment_batch.shape[0]))
+        for t in temperatures:
+            results = yield from decode_process(
+                segment_batch[pending],
+                t,
+                None if features is None else features[pending],
+            )
+            if features is None:
+                features = mx.stack([result.audio_features for result in results])
+            retry = []
+            for index, result in zip(pending, results):
+                final_decode[index] = result
+                failed = (
+                    compression_ratio_threshold is not None
+                    and result.compression_ratio > compression_ratio_threshold
+                ) or (
+                    logprob_threshold is not None
+                    and result.avg_logprob < logprob_threshold
+                )
+                silent = (
+                    no_speech_threshold is not None
+                    and result.no_speech_prob > no_speech_threshold
+                    and logprob_threshold is not None
+                    and result.avg_logprob < logprob_threshold
+                )
+                if failed and not silent:
+                    retry.append(index)
+            pending = retry
+            if not pending:
+                break
         return final_decode
 
-    clip_idx = 0
-    seek = seek_clips[clip_idx][0]
     input_stride = N_FRAMES // model.dims.n_audio_ctx  # mel frames per output token: 2
     time_precision = (
         input_stride * HOP_LENGTH / SAMPLE_RATE
@@ -258,38 +482,63 @@ def transcribe_audio(
         initial_prompt_tokens = []
 
     def new_segment(
-        *, start: float, end: float, tokens: mx.array, result: DecodingResult
+        *,
+        current_seek: int,
+        start: float,
+        end: float,
+        tokens: mx.array,
+        result: DecodingResult,
     ):
         tokens = tokens.tolist()
         text_tokens = [token for token in tokens if token < tokenizer.eot]
         return {
-            "seek": seek,
+            "seek": current_seek,
             "start": start,
             "end": end,
             "text": tokenizer.decode(text_tokens),
             "tokens": tokens,
-            "temperature": res.temperature,
-            "avg_logprob": res.avg_logprob,
-            "compression_ratio": res.compression_ratio,
-            "no_speech_prob": res.no_speech_prob,
+            "temperature": result.temperature,
+            "avg_logprob": result.avg_logprob,
+            "compression_ratio": result.compression_ratio,
+            "no_speech_prob": result.no_speech_prob,
         }
-    
-    def format_output(tokens, res):
-        seek = 0
+
+    last_speech_timestamp = 0.0
+
+    def format_output(tokens, res, current_seek, segment_size, mel_segment):
+        nonlocal last_speech_timestamp
+        previous_seek = current_seek
+        seek = current_seek
+        time_offset = current_seek * HOP_LENGTH / SAMPLE_RATE
+        segment_duration = segment_size * HOP_LENGTH / SAMPLE_RATE
+        window_end_time = time_offset + segment_duration
         current_segments = []
+
+        def bound_segments(segments):
+            bounded = []
+            for segment in segments:
+                start = max(time_offset, segment["start"])
+                end = min(window_end_time, segment["end"])
+                if start >= end:
+                    continue
+                segment["start"], segment["end"] = start, end
+                # Preserve aligned text/tokens, including words that collapse
+                # onto a clip edge, while bounding all reported metadata.
+                for word in segment.get("words", ()):
+                    word["start"] = max(
+                        time_offset, min(window_end_time, word["start"])
+                    )
+                    word["end"] = max(word["start"], min(window_end_time, word["end"]))
+                bounded.append(segment)
+            return bounded
 
         if no_speech_threshold is not None:
             should_skip = res.no_speech_prob > no_speech_threshold
-            if (
-                logprob_threshold is not None
-                and res.avg_logprob > logprob_threshold
-            ):
+            if logprob_threshold is not None and res.avg_logprob > logprob_threshold:
                 should_skip = False
 
             if should_skip:
-                seek += (
-                    segment_size 
-                )
+                seek += segment_size
                 return current_segments, seek
 
         def word_anomaly_score(word: dict) -> float:
@@ -307,9 +556,7 @@ def transcribe_audio(
         def is_segment_anomaly(segment: Optional[dict]) -> bool:
             if segment is None or not segment["words"]:
                 return False
-            words = [
-                w for w in segment["words"] if w["word"] not in punctuation
-            ]
+            words = [w for w in segment["words"] if w["word"] not in punctuation]
             words = words[:8]
             score = sum(word_anomaly_score(w) for w in words)
             return score >= 3 or score + 0.01 >= len(words)
@@ -338,13 +585,11 @@ def transcribe_audio(
                 start_timestamp_pos = (
                     sliced_tokens[0].item() - tokenizer.timestamp_begin
                 )
-                end_timestamp_pos = (
-                    sliced_tokens[-1].item() - tokenizer.timestamp_begin
-                )
+                end_timestamp_pos = sliced_tokens[-1].item() - tokenizer.timestamp_begin
                 current_segments.append(
                     new_segment(
-                        start=time_offset
-                        + start_timestamp_pos * time_precision,
+                        current_seek=current_seek,
+                        start=time_offset + start_timestamp_pos * time_precision,
                         end=time_offset + end_timestamp_pos * time_precision,
                         tokens=sliced_tokens,
                         result=res,
@@ -366,13 +611,12 @@ def transcribe_audio(
                 len(timestamps) > 0
                 and timestamps[-1].item() != tokenizer.timestamp_begin
             ):
-                last_timestamp_pos = (
-                    timestamps[-1].item() - tokenizer.timestamp_begin
-                )
+                last_timestamp_pos = timestamps[-1].item() - tokenizer.timestamp_begin
                 duration = last_timestamp_pos * time_precision
 
             current_segments.append(
                 new_segment(
+                    current_seek=current_seek,
                     start=time_offset,
                     end=time_offset + duration,
                     tokens=tokens,
@@ -381,69 +625,179 @@ def transcribe_audio(
             )
             seek += segment_size
 
+        current_segments = bound_segments(current_segments)
+        if word_timestamps:
+            add_word_timestamps(
+                segments=current_segments,
+                model=model,
+                tokenizer=tokenizer,
+                mel=mel_segment,
+                num_frames=segment_size,
+                prepend_punctuations=prepend_punctuations,
+                append_punctuations=append_punctuations,
+                last_speech_timestamp=last_speech_timestamp,
+                audio_features=res.audio_features,
+            )
+            current_segments = bound_segments(current_segments)
+
+            if not single_timestamp_ending:
+                last_word_end = _get_end(current_segments)
+                if last_word_end is not None and last_word_end > time_offset:
+                    seek = round(last_word_end * FRAMES_PER_SECOND)
+
+            # skip silence before possible hallucinations
+            if hallucination_silence_threshold is not None:
+                threshold = hallucination_silence_threshold
+                if not single_timestamp_ending:
+                    last_word_end = _get_end(current_segments)
+                    if last_word_end is not None and last_word_end > time_offset:
+                        remaining_duration = window_end_time - last_word_end
+                        if remaining_duration > threshold:
+                            seek = round(last_word_end * FRAMES_PER_SECOND)
+                        else:
+                            seek = previous_seek + segment_size
+
+                # if first segment might be a hallucination, skip leading silence
+                first_segment = next_words_segment(current_segments)
+                if first_segment is not None and is_segment_anomaly(first_segment):
+                    gap = first_segment["start"] - time_offset
+                    if gap > threshold:
+                        seek = previous_seek + round(gap * FRAMES_PER_SECOND)
+                        return [], seek
+
+                # skip silence before any possible hallucination that is surrounded
+                # by silence or more hallucinations
+                hal_last_end = last_speech_timestamp
+                for si in range(len(current_segments)):
+                    segment = current_segments[si]
+                    if not segment["words"]:
+                        continue
+                    if is_segment_anomaly(segment):
+                        next_segment = next_words_segment(current_segments[si + 1 :])
+                        if next_segment is not None:
+                            hal_next_start = next_segment["words"][0]["start"]
+                        else:
+                            hal_next_start = time_offset + segment_duration
+                        silence_before = (
+                            segment["start"] - hal_last_end > threshold
+                            or segment["start"] < threshold
+                            or segment["start"] - time_offset < 2.0
+                        )
+                        silence_after = (
+                            hal_next_start - segment["end"] > threshold
+                            or is_segment_anomaly(next_segment)
+                            or window_end_time - segment["end"] < 2.0
+                        )
+                        if silence_before and silence_after:
+                            seek = round(
+                                max(time_offset + 1, segment["start"])
+                                * FRAMES_PER_SECOND
+                            )
+                            if content_duration - segment["end"] < threshold:
+                                seek = content_frames
+                            current_segments[si:] = []
+                            break
+                    hal_last_end = segment["end"]
+
+            last_word_end = _get_end(current_segments)
+            if last_word_end is not None:
+                last_speech_timestamp = last_word_end
+
         for i, segment in enumerate(current_segments):
-            if (
-                segment["start"] == segment["end"]
-                or segment["text"].strip() == ""
-            ):
+            if segment["start"] == segment["end"] or segment["text"].strip() == "":
                 segment["text"] = ""
                 segment["tokens"] = []
                 segment["words"] = []
-        
+
         return current_segments, seek
 
-    seek_clip_end = seek_clips[0][1]
-    seek = -3000
-    while seek < seek_clip_end:
-        time_offset = float(seek * HOP_LENGTH / SAMPLE_RATE)
-
-        mel_segments = []
-        mel_timestamps = []
-
-        for _ in range(batch_size):
-            seek +=  N_FRAMES
-            if seek > seek_clip_end:
-                break
-            segment_size = min(
-                N_FRAMES, content_frames - seek, seek_clip_end - seek
+    # Conditioned windows depend on the previous decoded text; alignment can also
+    # change the next seek. Only independent windows may be decoded in a batch.
+    window_batch_size = (
+        1 if condition_on_previous_text or word_timestamps else batch_size
+    )
+    for clip_start, clip_end in seek_clips:
+        seek = clip_start
+        while seek < clip_end:
+            chunks = []
+            candidate_seek = seek
+            # An initial prompt belongs only to the first window, even when
+            # subsequent independent windows can share a batch.
+            width = (
+                1
+                if initial_prompt_tokens and prompt_reset_since == 0
+                else window_batch_size
             )
-            mel_segment = mel[seek : seek + segment_size]
+            for _ in range(width):
+                if candidate_seek >= clip_end:
+                    break
+                size = min(
+                    N_FRAMES, content_frames - candidate_seek, clip_end - candidate_seek
+                )
+                mel_segment = pad_or_trim(
+                    mel[candidate_seek : candidate_seek + size], N_FRAMES, axis=-2
+                ).astype(dtype)
+                chunks.append((candidate_seek, size, mel_segment))
+                candidate_seek += size
 
-            segment_duration = segment_size * HOP_LENGTH / SAMPLE_RATE
-            mel_segment = pad_or_trim(mel_segment, N_FRAMES, axis=-2).astype(dtype)
-            mel_segments.append(mel_segment)
-            mel_timestamps.append((seek, seek + segment_size))
-        
-        if not len(mel_segments):
-            break
-
-        mel_segment_batch = mx.array(mx.stack(mel_segments, axis=0))
-        decode_options["prompt"] = all_tokens[prompt_reset_since:]
-        result: DecodingResult = decode_with_fallback(mel_segment_batch)
-
-        for index, res in enumerate(result):
-            start_seek, end_seek = mel_timestamps[index]
-
-            tokens = np.array(res.tokens)
-            current_segments, value_seek = format_output(tokens, res) 
-
-            tokens =  [token
-                    for segment in current_segments
-                    for token in segment["tokens"]
+            active_indices = [
+                index
+                for index, (start, size, _) in enumerate(chunks)
+                if not is_constant_audio(
+                    audio, start * HOP_LENGTH, (start + size) * HOP_LENGTH
+                )
             ]
-
-            all_segments.append([start_seek, end_seek,tokenizer.decode(tokens)])
-               
-            all_tokens.extend(
-                [
-                    token
-                    for segment in current_segments
-                    for token in segment["tokens"]
-                ]
+            if not active_indices:
+                seek = chunks[-1][0] + chunks[-1][1]
+                detected_features = None
+                continue
+            active_chunks = [chunks[index] for index in active_indices]
+            decode_options["prompt"] = all_tokens[prompt_reset_since:]
+            features = None
+            if (
+                detected_features is not None
+                and content_frames >= N_FRAMES
+                and active_chunks[0][0] == 0
+                and active_chunks[0][1] == N_FRAMES
+            ):
+                # Only a full first window has the same encoder input as
+                # detection. Short windows zero-pad log-mel after trimming,
+                # whereas detection includes waveform-silence padding frames.
+                features = detected_features[None]
+                if len(active_chunks) > 1:
+                    remaining = model.embed_audio(
+                        mx.stack([chunk[2] for chunk in active_chunks[1:]])
+                    )
+                    features = mx.concatenate([features, remaining], axis=0)
+            detected_features = None
+            results = yield from decode_with_fallback(
+                mx.stack([chunk[2] for chunk in active_chunks]), features
             )
-
-            if not condition_on_previous_text or res.temperature > 0.5:
-                prompt_reset_since = len(all_tokens)
+            results_by_index = dict(zip(active_indices, results))
+            for index, (current_seek, size, mel_segment) in enumerate(chunks):
+                if index not in results_by_index:
+                    # Skipping an information-free window neither commits text
+                    # nor resets the previous speech/prompt conditioning.
+                    seek = min(clip_end, current_seek + size)
+                    continue
+                res = results_by_index[index]
+                tokens = np.array(res.tokens)
+                current_segments, next_seek = format_output(
+                    tokens, res, current_seek, size, mel_segment
+                )
+                for segment in current_segments:
+                    if verbose:
+                        line = f"[{_format_timestamp(segment['start'])} --> {_format_timestamp(segment['end'])}] {segment['text']}"
+                        print(make_safe(line))
+                    all_segments.append({"id": len(all_segments), **segment})
+                    all_tokens.extend(segment["tokens"])
+                if not condition_on_previous_text or res.temperature > 0.5:
+                    prompt_reset_since = len(all_tokens)
+                seek = min(clip_end, max(current_seek + 1, next_seek))
+                # An unfinished timestamp tail invalidates later predecoded
+                # windows: resume at its last completed timestamp instead.
+                if seek != current_seek + size:
+                    break
 
     return dict(
         text=tokenizer.decode(all_tokens[len(initial_prompt_tokens) :]),

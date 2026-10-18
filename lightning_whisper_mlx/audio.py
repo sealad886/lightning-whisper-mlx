@@ -3,7 +3,7 @@
 import os
 from functools import lru_cache
 from subprocess import CalledProcessError, run
-from typing import Optional, Union
+from typing import Union
 
 import mlx.core as mx
 import numpy as np
@@ -13,8 +13,8 @@ SAMPLE_RATE = 16000
 N_FFT = 400
 HOP_LENGTH = 160
 CHUNK_LENGTH = 30
-N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  
-N_FRAMES = N_SAMPLES // HOP_LENGTH  
+N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE
+N_FRAMES = N_SAMPLES // HOP_LENGTH
 
 N_SAMPLES_PER_TOKEN = HOP_LENGTH * 2  # the initial convolutions has stride 2
 FRAMES_PER_SECOND = SAMPLE_RATE // HOP_LENGTH  # 10ms per audio frame
@@ -59,6 +59,43 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
 
     return mx.array(np.frombuffer(out, np.int16)).flatten().astype(mx.float32) / 32768.0
+
+
+def prepare_audio(audio):
+    """Normalize a mono waveform once without changing its sample values.
+
+    Paths are decoded using the canonical loader. Existing MLX arrays retain
+    their storage and precision; callers can reuse the same PCM for mel and
+    exact acoustic-information checks.
+    """
+    with mx.stream(mx.cpu):
+        if isinstance(audio, (str, os.PathLike)):
+            audio = load_audio(str(audio))
+        elif not isinstance(audio, mx.array):
+            audio = mx.array(audio)
+        if audio.ndim != 1:
+            raise ValueError("audio waveform must be one-dimensional mono samples")
+        if not mx.all(mx.isfinite(audio)).item():
+            raise ValueError("audio waveform must contain only finite samples")
+        return audio
+
+
+def is_constant_audio(audio, start, end):
+    """Prove a window has no acoustic variation, with exact PCM equality.
+
+    Include real neighboring samples used by centered STFT frames. Artificial
+    right padding is excluded: it must not turn a constant recording into an
+    apparent acoustic event. No energy threshold or epsilon is used.
+    """
+    with mx.stream(mx.cpu):
+        start = max(0, start - N_FFT // 2)
+        end = min(audio.shape[0], end + N_FFT // 2)
+        if end <= start:
+            return True
+        samples = audio[start:end]
+        return bool(
+            (mx.all(mx.isfinite(samples)) & mx.all(samples == samples[0])).item()
+        )
 
 
 def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
@@ -141,34 +178,49 @@ def log_mel_spectrogram(
         The path to audio or either a NumPy or mlx array containing the audio waveform in 16 kHz
 
     n_mels: int
-        The number of Mel-frequency filters, only 80 is supported
+        The number of Mel-frequency filters: 80 or 128, matching the model.
 
     padding: int
         Number of zero samples to pad to the right
 
     Returns
     -------
-    mx.array, shape = (80, n_frames)
+    mx.array, shape = (n_frames, n_mels)
         An  array that contains the Mel spectrogram
     """
-    device = mx.default_device()
-    mx.set_default_device(mx.cpu)
-    if isinstance(audio, str):
-        audio = load_audio(audio)
-    elif not isinstance(audio, mx.array):
-        audio = mx.array(audio)
+    return log_mel_spectrogram_from_prepared(
+        prepare_audio(audio), n_mels=n_mels, padding=padding
+    )
 
-    if padding > 0:
-        audio = mx.pad(audio, (0, padding))
-    window = hanning(N_FFT)
-    freqs = stft(audio, window, nperseg=N_FFT, noverlap=HOP_LENGTH)
-    magnitudes = freqs[:-1, :].abs().square()
 
-    filters = mel_filters(n_mels)
-    mel_spec = magnitudes @ filters.T
+def log_mel_spectrogram_from_prepared(audio, n_mels=80, padding=0):
+    """Compute mel from validated PCM, eliding analytically zero FFT windows.
 
-    log_spec = mx.maximum(mel_spec, 1e-10).log10()
-    log_spec = mx.maximum(log_spec, log_spec.max() - 8.0)
-    log_spec = (log_spec + 4.0) / 4.0
-    mx.set_default_device(device)
-    return log_spec
+    A full FFT-window guard keeps all frames intersecting real samples and
+    makes reflected samples at the temporary right edge exactly zero. The
+    omitted frames are zero before the original floor/global-maximum clamp.
+    """
+    with mx.stream(mx.cpu):
+        work_padding = min(padding, N_FFT) if padding > 0 else 0
+        output_frames = (
+            (audio.size + padding) // HOP_LENGTH if padding > N_FFT else None
+        )
+        if work_padding > 0:
+            audio = mx.pad(audio, (0, work_padding))
+        window = hanning(N_FFT)
+        freqs = stft(audio, window, nperseg=N_FFT, noverlap=HOP_LENGTH)
+        magnitudes = freqs[:-1, :].abs().square()
+        filters = mel_filters(n_mels)
+        mel_spec = magnitudes @ filters.T
+        log_spec = mx.maximum(mel_spec, 1e-10).log10()
+        peak = log_spec.max()
+        log_spec = mx.maximum(log_spec, peak - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        if output_frames is not None and output_frames > log_spec.shape[0]:
+            floor = mx.array(1e-10, dtype=mel_spec.dtype).log10()
+            tail_value = (mx.maximum(floor, peak - 8.0) + 4.0) / 4.0
+            tail = mx.broadcast_to(
+                tail_value, (output_frames - log_spec.shape[0], n_mels)
+            )
+            log_spec = mx.concatenate([log_spec, tail], axis=0)
+        return log_spec
