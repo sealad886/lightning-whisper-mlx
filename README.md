@@ -15,6 +15,9 @@ checks for new performance qualification. See the
 The [short-case follow-up](docs/evaluation/short-case-optimization.md) profiles
 fixed costs, removes redundant padded-audio work, and records word-timing/output
 format coverage and the remaining benchmark gaps.
+The [native engine adversarial audit](docs/audits/native-engine-adversarial.md)
+records checkpoint integrity, concurrent model loading, decoder input and clip
+boundary fixes, filesystem-safe CLI outputs, and fresh verification evidence.
 
 ## Features
 
