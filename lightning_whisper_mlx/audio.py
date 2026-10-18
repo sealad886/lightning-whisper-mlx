@@ -188,19 +188,39 @@ def log_mel_spectrogram(
     mx.array, shape = (n_frames, n_mels)
         An  array that contains the Mel spectrogram
     """
-    with mx.stream(mx.cpu):
-        audio = prepare_audio(audio)
+    return log_mel_spectrogram_from_prepared(
+        prepare_audio(audio), n_mels=n_mels, padding=padding
+    )
 
-        if padding > 0:
-            audio = mx.pad(audio, (0, padding))
+
+def log_mel_spectrogram_from_prepared(audio, n_mels=80, padding=0):
+    """Compute mel from validated PCM, eliding analytically zero FFT windows.
+
+    A full FFT-window guard keeps all frames intersecting real samples and
+    makes reflected samples at the temporary right edge exactly zero. The
+    omitted frames are zero before the original floor/global-maximum clamp.
+    """
+    with mx.stream(mx.cpu):
+        work_padding = min(padding, N_FFT) if padding > 0 else 0
+        output_frames = (
+            (audio.size + padding) // HOP_LENGTH if padding > N_FFT else None
+        )
+        if work_padding > 0:
+            audio = mx.pad(audio, (0, work_padding))
         window = hanning(N_FFT)
         freqs = stft(audio, window, nperseg=N_FFT, noverlap=HOP_LENGTH)
         magnitudes = freqs[:-1, :].abs().square()
-
         filters = mel_filters(n_mels)
         mel_spec = magnitudes @ filters.T
-
         log_spec = mx.maximum(mel_spec, 1e-10).log10()
-        log_spec = mx.maximum(log_spec, log_spec.max() - 8.0)
+        peak = log_spec.max()
+        log_spec = mx.maximum(log_spec, peak - 8.0)
         log_spec = (log_spec + 4.0) / 4.0
+        if output_frames is not None and output_frames > log_spec.shape[0]:
+            floor = mx.array(1e-10, dtype=mel_spec.dtype).log10()
+            tail_value = (mx.maximum(floor, peak - 8.0) + 4.0) / 4.0
+            tail = mx.broadcast_to(
+                tail_value, (output_frames - log_spec.shape[0], n_mels)
+            )
+            log_spec = mx.concatenate([log_spec, tail], axis=0)
         return log_spec

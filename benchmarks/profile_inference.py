@@ -145,7 +145,7 @@ def profile(
     sample_next = Inference.sample_next
     from lightning_whisper_mlx import transcribe as transcription
 
-    prepare_audio = transcription.log_mel_spectrogram
+    prepare_audio = transcription.log_mel_spectrogram_from_prepared
 
     def timed(name, function, *args, **kwargs):
         mx.synchronize()
@@ -196,7 +196,7 @@ def profile(
     # This standalone diagnostic temporarily patches class/module entry points;
     # concurrent inference in the same process is unsupported.
     Inference.sample_next = timed_sample_next
-    transcription.log_mel_spectrogram = lambda *args, **kwargs: timed(
+    transcription.log_mel_spectrogram_from_prepared = lambda *args, **kwargs: timed(
         "audio_preparation", prepare_audio, *args, **kwargs
     )
     instrumented_start = time.perf_counter()
@@ -207,7 +207,7 @@ def profile(
         model.embed_audio, model.decoder = encode, decoder
         model._compiled_decoder = compiled_step
         Inference.sample_next = sample_next
-        transcription.log_mel_spectrogram = prepare_audio
+        transcription.log_mel_spectrogram_from_prepared = prepare_audio
     instrumented_seconds = time.perf_counter() - instrumented_start
     residual = max(0.0, instrumented_seconds - sum(sum(v) for v in stages.values()))
     stages["host_orchestration_and_postprocessing"] = [residual]

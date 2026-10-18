@@ -64,7 +64,9 @@ def test_transcription_rejects_assistant_with_different_mel_bins(monkeypatch):
     monkeypatch.setattr(transcribe.ModelHolder, "get_model", lambda *args: model(80))
     monkeypatch.setattr(transcribe, "load_model", lambda *args, **kwargs: model(128))
     monkeypatch.setattr(
-        transcribe, "log_mel_spectrogram", lambda *args, **kwargs: mx.zeros((3000, 80))
+        transcribe,
+        "log_mel_spectrogram_from_prepared",
+        lambda *args, **kwargs: mx.zeros((3000, 80)),
     )
     with pytest.raises(ValueError, match="mel bin count"):
         transcribe.transcribe_audio(
@@ -104,7 +106,9 @@ def test_transcription_reports_missing_mtp_checkpoint(monkeypatch, checkpoint_op
     )
     monkeypatch.setattr(transcribe.ModelHolder, "get_model", lambda *args: target)
     monkeypatch.setattr(
-        transcribe, "log_mel_spectrogram", lambda *args, **kwargs: mx.zeros((3000, 80))
+        transcribe,
+        "log_mel_spectrogram_from_prepared",
+        lambda *args, **kwargs: mx.zeros((3000, 80)),
     )
     with pytest.raises(ValueError, match="requires mtp_checkpoint"):
         transcribe.transcribe_audio(

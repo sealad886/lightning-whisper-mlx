@@ -14,7 +14,7 @@ from .audio import (
     N_FRAMES,
     N_SAMPLES,
     SAMPLE_RATE,
-    log_mel_spectrogram,
+    log_mel_spectrogram_from_prepared,
     pad_or_trim,
     prepare_audio,
     is_constant_audio,
@@ -312,7 +312,9 @@ def _transcribe_audio(
     # Decode file inputs once. The same original PCM supplies both mel frames
     # and the exact no-acoustic-information proof for each requested window.
     audio = prepare_audio(audio)
-    mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
+    mel = log_mel_spectrogram_from_prepared(
+        audio, n_mels=model.dims.n_mels, padding=N_SAMPLES
+    )
     content_frames = mel.shape[-2] - N_FRAMES
     content_duration = content_frames * HOP_LENGTH / SAMPLE_RATE
 

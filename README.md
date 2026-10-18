@@ -12,6 +12,9 @@ under desktop load, not a universal minimum. The
 hallucination, adds faster bounded greedy chunks, and requires recorded contention
 checks for new performance qualification. See the
 [original measurements](docs/evaluation/native-engine.md) for their precise scope.
+The [short-case follow-up](docs/evaluation/short-case-optimization.md) profiles
+fixed costs, removes redundant padded-audio work, and records word-timing/output
+format coverage and the remaining benchmark gaps.
 
 ## Features
 

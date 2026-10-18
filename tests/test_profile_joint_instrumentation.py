@@ -55,7 +55,10 @@ def test_profile_times_new_joint_graph_after_warmed_cache_eviction(monkeypatch):
 def test_profile_restores_outer_wrappers_when_instrumented_recording_fails(monkeypatch):
     model = Whisper(ModelDimensions(4, 3, 8, 2, 1, 32, 16, 8, 2, 1), mx.float32)
     decoder, encode = model.decoder, model.embed_audio
-    sample_next, prepare = Inference.sample_next, transcribe.log_mel_spectrogram
+    sample_next, prepare = (
+        Inference.sample_next,
+        transcribe.log_mel_spectrogram_from_prepared,
+    )
     calls = 0
 
     def recording(*args, **kwargs):
@@ -80,4 +83,4 @@ def test_profile_restores_outer_wrappers_when_instrumented_recording_fails(monke
     assert Inference.sample_next is sample_next
     assert model.decoder is decoder
     assert model.embed_audio == encode
-    assert transcribe.log_mel_spectrogram is prepare
+    assert transcribe.log_mel_spectrogram_from_prepared is prepare

@@ -115,8 +115,8 @@ Continue on the existing task branch; no new worktree or external publication.
 - [x] Collect host and native Metal profiles; measure decoder changes against the
   preserved checkpoint, retaining quality-valid benefits.
 - [x] Add bounded contention sampling and fail-closed benchmark qualification.
-- [ ] Complete matched comparisons when the required idle window is observed
-  (blocked by observed competing CPU/GPU work and paging).
+- [x] Complete matched comparisons under the user's revised nonblocking telemetry
+  policy; original strict idle qualification is not claimed.
 - [x] Run full native regression, real reference quality and independent review;
   update evidence and prepare a coherent local checkpoint.
 
@@ -175,3 +175,12 @@ The second attempt after native tests and packaging again stopped before model
 loading, exit 4: GPU 4/0/0%, nominal thermal state, CPU busy 54.25%/38.71%, four
 swapins and external Metal work. The required idle window remains unobserved;
 thresholds and external processes were not changed.
+
+The user subsequently authorized running without contention blocking. Two complete
+base/tiny comparison passes measured pooled speech gains of 1.299×/1.332× and
+silence-inclusive gains of 1.389×/1.410×, with all reference quality gates passing.
+The original idle-window condition is superseded for task acceptance. Further
+short-case profiling and the repeated optimized comparison are tracked in the
+[short-case plan](short-case-optimization.md) and
+[evaluation](../evaluation/short-case-optimization.md). Recorded activity remains a
+limit on generalization, not a reason to stop the requested measurements.

@@ -4,6 +4,11 @@ Date: 2026-10-18. Baseline: `cb82e1d`. This continues the
 [native engine evaluation](native-engine.md) and
 [implementation plan](../plans/native-inference-engine.md).
 
+This page records the state at checkpoint `76e3f46`. The user subsequently
+authorized comparisons without contention blocking; the
+[short-case follow-up](short-case-optimization.md) records the revised measurement
+policy, additional optimization and current feature coverage.
+
 ## Silence correction
 
 The recorded 29-second silence fixture contains exactly zero PCM. Whisper assigns
@@ -139,8 +144,9 @@ After native tests and packaging finished, a second attempt again stopped before
 model loading, exit 4. GPU samples fell to 4%, 0%, 0% and thermal state was nominal,
 but CPU busy remained 54.25% and 38.71%. Four swapins and external Codex Service
 and NotificationCenter Metal activity were observed. Telemetry was available.
-The quiet-window request remains pending; controlled external comparisons remain
-blocked. No threshold was relaxed and no external process was altered.
+At that checkpoint the quiet-window request remained pending and strict external
+comparisons were blocked. Later nonblocking measurements are linked above. No
+threshold was relaxed and no external process was altered.
 
 ```bash
 python -m benchmarks.compare_backends \

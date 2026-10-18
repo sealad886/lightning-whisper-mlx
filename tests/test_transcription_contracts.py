@@ -61,7 +61,9 @@ def transcription(monkeypatch):
         mel = mx.array(
             np.arange(round(seconds * 100) + 3000, dtype=np.float32)[:, None]
         )
-        monkeypatch.setattr(tr, "log_mel_spectrogram", lambda *args, **kwargs: mel)
+        monkeypatch.setattr(
+            tr, "log_mel_spectrogram_from_prepared", lambda *args, **kwargs: mel
+        )
         if waveform is None:
             waveform = np.resize(
                 np.array([0.0, 1.0], np.float32), round(seconds * 16000)
@@ -152,7 +154,7 @@ def test_independent_recordings_batch_without_sharing_conditioned_prompts(
     model, _ = transcription
     monkeypatch.setattr(
         tr,
-        "log_mel_spectrogram",
+        "log_mel_spectrogram_from_prepared",
         lambda audio, **kwargs: mx.array(
             (np.arange(9000, dtype=np.float32) + audio[0].item() * 15000)[:, None]
         ),
@@ -422,13 +424,40 @@ def test_file_waveform_is_decoded_once_before_mel_and_gate(transcription, monkey
     assert len(model.calls) == 1
 
 
+def test_transcription_validates_pcm_once_before_prepared_mel(
+    transcription, monkeypatch
+):
+    from lightning_whisper_mlx import audio
+
+    model, _ = transcription
+    model.dims = SimpleNamespace(n_mels=80, n_audio_ctx=1500)
+    original = audio.prepare_audio
+    preparations = []
+
+    def prepare(samples):
+        preparations.append(samples)
+        return original(samples)
+
+    monkeypatch.setattr(tr, "prepare_audio", prepare)
+    monkeypatch.setattr(audio, "prepare_audio", prepare)
+    result = tr.transcribe_audio(
+        np.zeros(16000, np.float32),
+        model_instance=model,
+        language="en",
+        fp16=False,
+        temperature=0.0,
+    )
+    assert result["text"] == ""
+    assert len(preparations) == 1
+
+
 def test_independent_request_batch_preserves_empty_and_speech_result_order(
     transcription, monkeypatch
 ):
     model, _ = transcription
     monkeypatch.setattr(
         tr,
-        "log_mel_spectrogram",
+        "log_mel_spectrogram_from_prepared",
         lambda audio, **kwargs: mx.array(
             (np.arange(3300, dtype=np.float32) + audio[0].item() * 30000)[:, None]
         ),
