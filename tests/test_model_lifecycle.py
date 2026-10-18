@@ -20,7 +20,16 @@ def test_loaded_checkpoint_honors_precision_without_casting_packed_weights(
     dims = ModelDimensions(4, 3, 32, 2, 1, 32, 16, 32, 2, 1)
     model = Whisper(dims, mx.float32)
     saved_dtype = mx.float32 if dtype == mx.float16 else mx.float16
-    model.update(tree_map(lambda value: value.astype(saved_dtype), model.parameters()))
+    model.update(
+        tree_map(
+            lambda value: (
+                value.astype(saved_dtype)
+                if mx.issubdtype(value.dtype, mx.floating)
+                else value
+            ),
+            model.parameters(),
+        )
+    )
     config = asdict(dims)
     if quantized:
         model.decoder.token_embedding = model.decoder.token_embedding.to_quantized(

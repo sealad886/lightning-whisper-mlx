@@ -8,7 +8,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_unflatten
 
 from . import whisper
 from .model_catalog import model_spec
@@ -87,7 +86,7 @@ def model_artifact_identity(path_or_hf_repo):
 def _apply_alignment_heads(model, heads):
     if isinstance(heads, str):
         heads = heads.encode("ascii")
-    elif isinstance(heads, list):
+    elif isinstance(heads, (list, np.ndarray)):
         pairs = np.asarray(heads)
         if (
             pairs.ndim != 2
@@ -179,8 +178,12 @@ def pack_attention_weights(weights):
             (bias.dtype for bias in ordinary_biases if bias is not None), mx.float32
         )
         biases = []
-        for weight, bias in zip(source_weights, ordinary_biases):
+        for source, weight, bias in zip(sources, source_weights, ordinary_biases):
             if bias is None:
+                if source != "key":
+                    raise ValueError(
+                        f"missing learned attention projection bias: {prefix}.{source}.bias"
+                    )
                 bias = mx.zeros((weight.shape[0],), dtype=bias_dtype)
             elif bias.shape != (weight.shape[0],):
                 raise ValueError(f"incompatible attention bias shape: {prefix}")
@@ -236,8 +239,11 @@ def load_model(
             class_predicate=lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
             and f"{p}.scales" in weights,
         )
-    model.update(tree_unflatten(list(weights.items())))
-    mx.eval(model.parameters())
+    # Alignment heads are optional derived metadata, not learned parameters.
+    # Validate saved pairs, then let explicit config/catalog masks take priority.
+    checkpoint_heads = weights.pop("alignment_heads", None)
+    if checkpoint_heads is not None:
+        _apply_alignment_heads(model, np.asarray(checkpoint_heads))
     heads = (
         alignment_heads
         if alignment_heads is not None
@@ -245,6 +251,9 @@ def load_model(
     )
     if heads is not None:
         _apply_alignment_heads(model, heads)
+    weights["alignment_heads"] = model.alignment_heads
+    model.load_weights(list(weights.items()))
+    mx.eval(model.parameters())
     model.supports_translation = (
         model.is_multilingual
         and (spec is None or spec.translate)
