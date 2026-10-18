@@ -345,12 +345,27 @@ class Whisper(nn.Module):
         encoder = getattr(self, "_compiled_encoder", None)
         return self.encoder(mel) if encoder is None else encoder(mel)
 
-    def configure_execution(self, *, compile_encoder=False, compile_decoder=False):
-        """Compile the shape-stable encoder after weights are loaded, if requested.
+    def configure_execution(
+        self,
+        *,
+        compile_encoder=False,
+        compile_decoder=False,
+        joint_decoding=False,
+        decode_chunk_size=1,
+    ):
+        """Configure compiled inference regions after weights are loaded.
 
         Changing weights/precision requires configuring again. Generation caches
         remain request-owned and are never captured as implicit compiled state.
+        Joint greedy generation can unroll one to four sequential cached steps;
+        the caller bounds each chunk by sample/context and cache-capacity seams.
         """
+        if (
+            isinstance(decode_chunk_size, bool)
+            or not isinstance(decode_chunk_size, int)
+            or not 1 <= decode_chunk_size <= 4
+        ):
+            raise ValueError("decode_chunk_size must be an integer between 1 and 4")
         self._compiled_encoder = mx.compile(self.encoder) if compile_encoder else None
         decoder = self.decoder
 
@@ -361,6 +376,11 @@ class Whisper(nn.Module):
             return logits, state, hidden
 
         self._compiled_decoder = mx.compile(decoder_step) if compile_decoder else None
+        # Joint generation callables belong to this model. Changing
+        # execution/weights must not leave closures holding a previous graph.
+        self._joint_decoding = bool(joint_decoding and compile_decoder)
+        self._decode_chunk_size = decode_chunk_size
+        self._joint_decoder_cache = {}
 
     def logits(self, tokens, audio_features):
         return self.decoder(tokens, audio_features)[0]

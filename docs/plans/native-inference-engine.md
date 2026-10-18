@@ -102,3 +102,76 @@ or explicit asset/environment-bound proof gap. Source implementation and measure
 performance acceptance are tracked separately. No task is called fully complete
 while required work remains. Final handoff includes exact tests, measured gains,
 failed experiments, limitations and local/publication status.
+
+## Follow-up: silence and remaining decoder costs
+
+Authorized 2026-10-18 after checkpoint `cb82e1d`: fix the recorded silence
+hallucination, profile remaining decoder costs, retain further quality-preserving
+optimizations and repeat direct comparisons under observed uncontended conditions.
+Continue on the existing task branch; no new worktree or external publication.
+
+- [x] Diagnose and regress silence behavior, including quiet speech and mixed
+  speech/silence windows.
+- [x] Collect host and native Metal profiles; measure decoder changes against the
+  preserved checkpoint, retaining quality-valid benefits.
+- [x] Add bounded contention sampling and fail-closed benchmark qualification.
+- [ ] Complete matched comparisons when the required idle window is observed
+  (blocked by observed competing CPU/GPU work and paging).
+- [x] Run full native regression, real reference quality and independent review;
+  update evidence and prepare a coherent local checkpoint.
+
+Silence must not be addressed by globally weakening a quality threshold or
+dropping quiet speech based on an arbitrary amplitude cutoff. Exact absence of
+acoustic information and learned/nonzero-noise speech detection are distinct
+contracts. Preserve timestamp, clip, per-record language and conditioning state.
+Decoder experiments retain canonical filters, EOT and score arithmetic and the
+existing speculative interfaces. A combined compiled numerical region is an
+experiment until real outputs and paired timings validate it.
+
+Benchmark readiness requires recorded GPU/CPU activity, power/thermal and memory
+state before and after rounds, not an assumption from process names or low CPU.
+Do not stop or alter competing user jobs. If telemetry cannot establish an idle
+window, retain a blocked/unknown qualification result rather than relabeling a
+loaded run as uncontended; complete independent implementation work meanwhile.
+
+Silence implementation: exact finite-constant PCM windows, including real
+centered-STFT context, bypass decoding. No amplitude cutoff or change to the
+model's no-speech confidence override. Seven public regressions failed before
+the fix; 77 focused native tests passed afterward. The 64-output base/tiny real
+matrix (timestamps on/off; standard fixtures, quiet speech, DC, mixed recordings)
+changes only three hallucinating-silence outputs to empty text. Non-silence text
+and 108 comparable segment scores match exactly; reference word errors never
+increase. Nonconstant noisy silence still requires separate speech-detection
+evidence and is not covered by this exact acoustic-information proof.
+
+Profiles: seven real base invocations record 623 decoder steps. `forward_block`
+accounts for 0.1387 seconds of host-profile self time; generation includes the
+token-by-token GPU completion wait. A native Metal capture and a 10.26-second
+Metal System Trace were collected. The system trace shows 6,036 target compute
+encoder intervals (2.492 seconds summed), alongside external application GPU
+work. Its shader timeline is disabled, so it does not justify a specific custom
+kernel. First joint decoder/sampler comparisons preserve exact outputs, showing
+1.063× base and 1.012× tiny throughput relative to separate calls under desktop
+load; bounded multi-step compilation was then measured separately.
+
+The subsequent chunk-size experiment is complete: joint four preserves every
+checked token, timestamp and score in the 64-output real matrix and wins both
+independent speech-policy passes (base 1.145×/1.113×, tiny 1.325×/1.159× relative
+to separate compiled calls). Resident compiled sessions now select joint four;
+low-level defaults stay explicit separate/one for comparison. The integrated
+native suite passes all 383 tests, including the final profiler replay regressions.
+Instrumentation wraps the outer joint inference boundary so newly compiled graphs
+stay pure; all tensor outputs and cache state are evaluated for stage timing.
+The isolated final wheel contains 31 first-party sources, all byte-identical to
+the verified checkout. Independent review found no source blocker. Coverage
+percentage was not measured because no coverage plugin is installed.
+
+The first strict external comparison attempt stopped before model loading:
+GPU 17/21/25%, Foundation thermal state 1 (FAIR), CPU busy 99.62%/98.98%, active
+graphify, Backblaze, Finder and other application GPU work. Telemetry was available
+and classified busy, exit 4. No jobs were stopped or modified. This is a retained
+failed readiness observation, not an uncontended benchmark or a product failure.
+The second attempt after native tests and packaging again stopped before model
+loading, exit 4: GPU 4/0/0%, nominal thermal state, CPU busy 54.25%/38.71%, four
+swapins and external Metal work. The required idle window remains unobserved;
+thresholds and external processes were not changed.

@@ -14,6 +14,7 @@ import time
 from .cpp_backend import CppBackend, MAX_SAMPLES, file_digest, source_identity
 from .quality import assess_backend_results
 from .runner import BenchmarkCase, BenchmarkConfig, BenchmarkSuite
+from .contention import ContentionError, ContentionPolicy, QuietGuard
 
 
 def decode_pcm(path):
@@ -222,6 +223,8 @@ def build_parser():
     parser.add_argument("--beam-size", type=int, default=1)
     parser.add_argument("--compile-encoder", action="store_true")
     parser.add_argument("--compile-decoder", action="store_true")
+    parser.add_argument("--joint-decoding", action="store_true")
+    parser.add_argument("--decode-chunk-size", type=int, choices=range(1, 5), default=1)
     parser.add_argument("--pipeline", action="store_true")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--no-conditioning", action="store_true")
@@ -229,6 +232,18 @@ def build_parser():
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repetitions", type=int, default=7)
     parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument(
+        "--require-uncontended",
+        action="store_true",
+        help="Fail closed unless bounded OS telemetry windows show low contention; does not guarantee exclusive hardware ownership",
+    )
+    parser.add_argument("--contention-samples", type=int, default=3)
+    parser.add_argument("--contention-interval", type=float, default=0.5)
+    parser.add_argument("--contention-cooldown", type=float, default=2)
+    parser.add_argument("--max-background-gpu-percent", type=float, default=5)
+    parser.add_argument("--max-background-cpu-percent", type=float, default=20)
+    parser.add_argument("--max-competing-compute-cpu-percent", type=float, default=5)
+    parser.add_argument("--min-memory-free-percent", type=float, default=10)
     parser.add_argument("--max-wer-regression", type=float, default=0)
     parser.add_argument("--max-cer-regression", type=float, default=0)
     parser.add_argument("--output", type=Path, required=True)
@@ -240,6 +255,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error("output already exists")
+    if args.joint_decoding and (
+        not args.compile_decoder or args.pipeline or args.beam_size != 1
+    ):
+        parser.error(
+            "joint decoding requires compiled greedy decoding without pipeline"
+        )
+    if args.decode_chunk_size != 1 and not args.joint_decoding:
+        parser.error("decode chunk size requires joint decoding")
     if (
         args.threads < 1
         or args.beam_size < 1
@@ -289,6 +312,10 @@ def main(argv=None):
         "mlx_compile_encoder": args.compile_encoder,
         "mlx_compile_decoder": args.compile_decoder,
         "mlx_pipeline": args.pipeline,
+        "mlx_joint_decoding": args.joint_decoding,
+        "mlx_decode_chunk_size": args.decode_chunk_size,
+        "mlx_constant_pcm_rejection": True,
+        "constant_pcm_policy": "MLX rejects exactly constant finite PCM with real centered-STFT context; cpp native policy unchanged; speech-only ratios must be reported separately",
         "length_penalty": None,
         "suppress_blank": True,
         "suppress_non_speech_tokens": True,
@@ -301,6 +328,42 @@ def main(argv=None):
         "cpp_aneforge": False,
         "cpp_threads": args.threads,
     }
+    policy = ContentionPolicy(
+        samples=args.contention_samples,
+        interval_seconds=args.contention_interval,
+        cooldown_seconds=args.contention_cooldown,
+        max_gpu_percent=args.max_background_gpu_percent,
+        max_cpu_busy_percent=args.max_background_cpu_percent,
+        max_compute_cpu_percent=args.max_competing_compute_cpu_percent,
+        min_memory_free_percent=args.min_memory_free_percent,
+    )
+    guard = QuietGuard(policy, required=args.require_uncontended)
+
+    def blocked_by_contention(error):
+        summary = guard.summary()
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with args.output.open("x") as stream:
+            json.dump(
+                {
+                    "status": "blocked-by-contention",
+                    "error": str(error),
+                    "contention": summary,
+                    "options": options,
+                    "artifacts": artifacts,
+                    "inputs": inputs,
+                },
+                stream,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            stream.write("\n")
+        return 3 if summary["status"] == "unknown" else 4
+
+    try:
+        guard.check("preflight-before-model-loading", cooldown=True)
+    except ContentionError as error:
+        return blocked_by_contention(error)
     # Import/loading are outside warmed PCM-to-result timing for both engines.
     start = time.perf_counter()
     import mlx.core as mx
@@ -312,7 +375,10 @@ def main(argv=None):
     model = load_model(str(args.mlx_model.resolve()), dtype=mx.float16)
     if args.compile_encoder or args.compile_decoder:
         model.configure_execution(
-            compile_encoder=args.compile_encoder, compile_decoder=args.compile_decoder
+            compile_encoder=args.compile_encoder,
+            compile_decoder=args.compile_decoder,
+            joint_decoding=args.joint_decoding,
+            decode_chunk_size=args.decode_chunk_size,
         )
     mx.eval(model.parameters())
     mx.synchronize()
@@ -339,6 +405,9 @@ def main(argv=None):
         timeout=args.timeout,
         suppress_tokens=suppression_ids,
     ) as cpp:
+        process = getattr(cpp, "process", None)
+        if process is not None:
+            guard.owned_pids.add(process.pid)
         cpp_setup = time.perf_counter() - start
         for key, value in cpp.ready["dimensions"].items():
             if config[key] != value:
@@ -395,25 +464,54 @@ def main(argv=None):
                 outputs.append(result)
             return outputs
 
-        results = suite.run(
-            runner,
-            metadata={
-                "artifacts": artifacts,
-                "inputs": inputs,
-                "options": options,
-                "cpp_runtime": cpp.ready,
-                "timing_scope": "warm resident canonical PCM to structured result; cpp request/response IPC included; upload excluded",
-                "cold_setup_seconds": {
-                    "mlx_import": import_seconds,
-                    "mlx_model": mlx_setup,
-                    "cpp_process_and_model": cpp_setup,
+        completed_samples = 0
+        pair_count = len(suite.config.cases)
+
+        def before_sample():
+            if completed_samples % pair_count == 0:
+                guard.check(
+                    f"before-timed-pair-{completed_samples // pair_count}",
+                    cooldown=True,
+                )
+
+        def after_sample():
+            nonlocal completed_samples
+            completed_samples += 1
+            status = None
+            if completed_samples % pair_count == 0:
+                status = guard.check(
+                    f"after-timed-pair-{completed_samples // pair_count - 1}",
+                    cooldown=True,
+                )["status"]
+            return {
+                "paired_round": (completed_samples - 1) // pair_count,
+                "contention_after_pair": status,
+            }
+
+        try:
+            results = suite.run(
+                runner,
+                before_sample=before_sample,
+                after_sample=after_sample,
+                metadata={
+                    "artifacts": artifacts,
+                    "inputs": inputs,
+                    "options": options,
+                    "cpp_runtime": cpp.ready,
+                    "timing_scope": "warm resident canonical PCM to structured result; cpp request/response IPC included; upload excluded",
+                    "cold_setup_seconds": {
+                        "mlx_import": import_seconds,
+                        "mlx_model": mlx_setup,
+                        "cpp_process_and_model": cpp_setup,
+                    },
+                    "cold_scope": "in-process setup diagnostics; not cold CLI latency",
+                    "reference_sha256": (
+                        file_digest(args.references) if args.references else None
+                    ),
                 },
-                "cold_scope": "in-process setup diagnostics; not cold CLI latency",
-                "reference_sha256": (
-                    file_digest(args.references) if args.references else None
-                ),
-            },
-        )
+            )
+        except ContentionError as error:
+            return blocked_by_contention(error)
     assessment = assess_backend_results(
         results,
         references,
@@ -427,7 +525,15 @@ def main(argv=None):
         )
     if not args.without_timestamps:
         assessment["speed_claim_qualified"] = False
-    report = {**suite.to_dict(results), "assessment": assessment}
+    contention = guard.summary()
+    assessment["contention_qualified"] = contention["qualified"]
+    if not contention["qualified"]:
+        assessment["speed_claim_qualified"] = False
+    report = {
+        **suite.to_dict(results),
+        "assessment": assessment,
+        "contention": contention,
+    }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x") as stream:
         json.dump(report, stream, indent=2, sort_keys=True, allow_nan=False)

@@ -60,6 +60,13 @@ and request ownership must also support repeated and independent transcriptions.
    retaining eager controls for differential measurement. Keep one-step
    pipelining disabled by default: it remains a bounded scheduling experiment
    rather than an established improvement.
+7. After the measured follow-up, combine cached decoding and canonical greedy
+   sampling in bounded chunks of up to four sequential steps. Respect existing
+   cache-capacity seams, sample/context budgets and EOT scoring. Resident sessions
+   select this policy; low-level separate execution remains available for
+   differential experiments. Reject exactly constant finite PCM windows using
+   real centered-STFT context; preserve the model's confidence policy for all
+   nonconstant signals.
 
 ## Consequences
 
@@ -112,8 +119,9 @@ and request ownership must also support repeated and independent transcriptions.
   median elapsed time for a declared configuration. Qualify text against human
   references with relative WER/CER and silence behavior; timestamp workloads need
   their own checks. Passing speech cases cannot qualify a failing silence bucket.
-  Long silence without timestamps currently remains a quality limitation; the
-  full corpus has no universal speed qualification. After correcting short-window
+  The initial long-silence failure is corrected for proven constant PCM in the
+  follow-up; nonconstant noise and broader timestamp quality remain unqualified.
+  The corpus has no universal speed qualification. After correcting short-window
   padding reuse, the real automatic-language rerun matches baseline text and tokens.
 - **IMP-004:** Seek reproducible quality-preserving improvements beyond 1.4x where
   profiles justify them. Report per-workload and aggregate results with their
@@ -129,3 +137,4 @@ and request ownership must also support repeated and independent transcriptions.
   [compilation](https://ml-explore.github.io/mlx/build/html/usage/compile.html), and
   [KV cache guidance](https://ml-explore.github.io/mlx/build/html/usage/kv_cache.html).
 - **REF-005:** [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
+- **REF-006:** [Silence and decoder follow-up](../evaluation/silence-decoder-followup.md).

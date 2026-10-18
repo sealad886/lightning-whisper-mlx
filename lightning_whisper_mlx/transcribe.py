@@ -16,6 +16,8 @@ from .audio import (
     SAMPLE_RATE,
     log_mel_spectrogram,
     pad_or_trim,
+    prepare_audio,
+    is_constant_audio,
 )
 from .decoding import DecodingOptions, DecodingResult
 from .load_models import load_model, model_artifact_identity
@@ -307,7 +309,9 @@ def _transcribe_audio(
             assistant = load_model(assistant, dtype=dtype)
             decode_options["assistant_model"] = assistant
 
-    # Pad 30-seconds of silence to the input audio, for slicing
+    # Decode file inputs once. The same original PCM supplies both mel frames
+    # and the exact no-acoustic-information proof for each requested window.
+    audio = prepare_audio(audio)
     mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
     content_frames = mel.shape[-2] - N_FRAMES
     content_duration = content_frames * HOP_LENGTH / SAMPLE_RATE
@@ -709,28 +713,47 @@ def _transcribe_audio(
                 chunks.append((candidate_seek, size, mel_segment))
                 candidate_seek += size
 
+            active_indices = [
+                index
+                for index, (start, size, _) in enumerate(chunks)
+                if not is_constant_audio(
+                    audio, start * HOP_LENGTH, (start + size) * HOP_LENGTH
+                )
+            ]
+            if not active_indices:
+                seek = chunks[-1][0] + chunks[-1][1]
+                detected_features = None
+                continue
+            active_chunks = [chunks[index] for index in active_indices]
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
             features = None
             if (
                 detected_features is not None
                 and content_frames >= N_FRAMES
-                and chunks[0][0] == 0
-                and chunks[0][1] == N_FRAMES
+                and active_chunks[0][0] == 0
+                and active_chunks[0][1] == N_FRAMES
             ):
                 # Only a full first window has the same encoder input as
                 # detection. Short windows zero-pad log-mel after trimming,
                 # whereas detection includes waveform-silence padding frames.
                 features = detected_features[None]
-                if len(chunks) > 1:
+                if len(active_chunks) > 1:
                     remaining = model.embed_audio(
-                        mx.stack([chunk[2] for chunk in chunks[1:]])
+                        mx.stack([chunk[2] for chunk in active_chunks[1:]])
                     )
                     features = mx.concatenate([features, remaining], axis=0)
             detected_features = None
             results = yield from decode_with_fallback(
-                mx.stack([chunk[2] for chunk in chunks]), features
+                mx.stack([chunk[2] for chunk in active_chunks]), features
             )
-            for (current_seek, size, mel_segment), res in zip(chunks, results):
+            results_by_index = dict(zip(active_indices, results))
+            for index, (current_seek, size, mel_segment) in enumerate(chunks):
+                if index not in results_by_index:
+                    # Skipping an information-free window neither commits text
+                    # nor resets the previous speech/prompt conditioning.
+                    seek = min(clip_end, current_seek + size)
+                    continue
+                res = results_by_index[index]
                 tokens = np.array(res.tokens)
                 current_segments, next_seek = format_output(
                     tokens, res, current_seek, size, mel_segment

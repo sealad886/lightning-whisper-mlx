@@ -59,6 +59,19 @@ def test_policy_comparison_reports_changed_observable_output():
     assert not payload["text_outputs_equal"]
 
 
+def test_policy_comparison_selects_joint_generation_separately():
+    payload = compare_policies(
+        lambda policy: {"text": "same"}, warmups=0, repetitions=1
+    )
+    by_name = {policy["name"]: policy for policy in payload["policies"]}
+    assert by_name["compiled_joint"]["joint_decoding"]
+    assert by_name["compiled_joint"]["compile_decoder"]
+    assert not by_name["compiled_joint"]["pipeline"]
+    assert not by_name["compiled_both"]["joint_decoding"]
+    assert by_name["compiled_joint_2"]["decode_chunk_size"] == 2
+    assert by_name["compiled_joint_4"]["decode_chunk_size"] == 4
+
+
 def test_policy_comparison_rejects_invalid_execution_counts():
     with pytest.raises(ValueError, match="repetitions"):
         compare_policies(lambda policy: {"text": ""}, repetitions=0)

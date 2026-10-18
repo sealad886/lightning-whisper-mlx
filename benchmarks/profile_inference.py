@@ -16,7 +16,11 @@ POLICIES = (
     ("compiled_decoder", False, True, False),
     ("compiled_both", True, True, False),
     ("compiled_both_pipeline", True, True, True),
+    ("compiled_joint", True, True, False),
+    ("compiled_joint_2", True, True, False),
+    ("compiled_joint_4", True, True, False),
 )
+JOINT_CHUNKS = {"compiled_joint": 1, "compiled_joint_2": 2, "compiled_joint_4": 4}
 
 
 def compare_policies(
@@ -56,6 +60,8 @@ def compare_policies(
             "compile_encoder": encoder,
             "compile_decoder": decoder,
             "pipeline": pipeline,
+            "joint_decoding": name in JOINT_CHUNKS,
+            "decode_chunk_size": JOINT_CHUNKS.get(name, 1),
         }
         for name, encoder, decoder, pipeline in POLICIES
     ]
@@ -83,13 +89,19 @@ def profile(
     compile_encoder=False,
     compile_decoder=False,
     pipeline=False,
+    joint_decoding=False,
+    decode_chunk_size=1,
     word_timestamps=False
 ):
     import mlx.core as mx
     from lightning_whisper_mlx.transcribe import transcribe_audio
+    from lightning_whisper_mlx.decoding import Inference
 
     model.configure_execution(
-        compile_encoder=compile_encoder, compile_decoder=compile_decoder
+        compile_encoder=compile_encoder,
+        compile_decoder=compile_decoder,
+        joint_decoding=joint_decoding,
+        decode_chunk_size=decode_chunk_size,
     )
     options = dict(
         model_instance=model,
@@ -130,6 +142,7 @@ def profile(
     stages = {}
     encode, decoder = model.embed_audio, model.decoder
     compiled_step = getattr(model, "_compiled_decoder", None)
+    sample_next = Inference.sample_next
     from lightning_whisper_mlx import transcribe as transcription
 
     prepare_audio = transcription.log_mel_spectrogram
@@ -143,12 +156,33 @@ def profile(
         return result
 
     def timed_decoder(*args, **kwargs):
+        if kwargs.get("offset") is not None:
+            # Joint cache misses may trace this wrapper. Tensor-offset calls are
+            # pure numerical work; measure their outer inference boundary only.
+            return decoder(*args, **kwargs)
         name = (
             "alignment"
             if kwargs.get("return_scores")
             else "prefill" if kwargs.get("kv_cache") is None else "cached_step"
         )
         return timed(name, decoder, *args, **kwargs)
+
+    def timed_sample_next(inference, tokens, *args, **kwargs):
+        if inference.model is not model:
+            return sample_next(inference, tokens, *args, **kwargs)
+        mx.synchronize()
+        start = time.perf_counter()
+        result = sample_next(inference, tokens, *args, **kwargs)
+        # Tokens alone need not depend on the final score or every cache update.
+        # Evaluate the complete raw tensor result and explicit cache arrays.
+        mx.eval(result, inference.cache_state)
+        name = (
+            "cached_chunk"
+            if result[0].shape[-1] - tokens.shape[-1] > 1
+            else "cached_step"
+        )
+        stages.setdefault(name, []).append(time.perf_counter() - start)
+        return result
 
     model.embed_audio = lambda *args, **kwargs: timed(
         "encoder", encode, *args, **kwargs
@@ -158,6 +192,10 @@ def profile(
         model._compiled_decoder = lambda *args: timed(
             "cached_step", compiled_step, *args
         )
+    # Instrument the inference boundary, including newly created/evicted graphs.
+    # This standalone diagnostic temporarily patches class/module entry points;
+    # concurrent inference in the same process is unsupported.
+    Inference.sample_next = timed_sample_next
     transcription.log_mel_spectrogram = lambda *args, **kwargs: timed(
         "audio_preparation", prepare_audio, *args, **kwargs
     )
@@ -168,6 +206,7 @@ def profile(
     finally:
         model.embed_audio, model.decoder = encode, decoder
         model._compiled_decoder = compiled_step
+        Inference.sample_next = sample_next
         transcription.log_mel_spectrogram = prepare_audio
     instrumented_seconds = time.perf_counter() - instrumented_start
     residual = max(0.0, instrumented_seconds - sum(sum(v) for v in stages.values()))
@@ -177,6 +216,8 @@ def profile(
             "compile_encoder": compile_encoder,
             "pipeline": pipeline,
             "compile_decoder": compile_decoder,
+            "joint_decoding": joint_decoding,
+            "decode_chunk_size": decode_chunk_size,
             "word_timestamps": word_timestamps,
         },
         "durations_seconds": durations,
@@ -193,7 +234,7 @@ def profile(
             }
             for key, values in stages.items()
         },
-        "stage_scope": "one separately instrumented invocation; synchronization perturbs scheduling",
+        "stage_scope": "one separately instrumented invocation; synchronization perturbs scheduling; joint cached chunks/steps include canonical filtering and sampling as well as decoding; standalone process only, concurrent inference unsupported",
         "memory": memory,
     }
 
@@ -227,12 +268,29 @@ def main(argv=None):
     }
     execution = {}
     for name, encoder, decoder, _ in POLICIES:
-        model.configure_execution(compile_encoder=encoder, compile_decoder=decoder)
-        execution[name] = (model._compiled_encoder, model._compiled_decoder)
+        joint = name in JOINT_CHUNKS
+        chunk = JOINT_CHUNKS.get(name, 1)
+        model.configure_execution(
+            compile_encoder=encoder,
+            compile_decoder=decoder,
+            joint_decoding=joint,
+            decode_chunk_size=chunk,
+        )
+        execution[name] = (
+            model._compiled_encoder,
+            model._compiled_decoder,
+            joint,
+            chunk,
+        )
 
     def run_policy(policy):
         name, _, _, pipeline = policy
-        model._compiled_encoder, model._compiled_decoder = execution[name]
+        (
+            model._compiled_encoder,
+            model._compiled_decoder,
+            model._joint_decoding,
+            model._decode_chunk_size,
+        ) = execution[name]
         result = transcribe_audio(
             pcm,
             model_instance=model,
@@ -282,7 +340,7 @@ def main(argv=None):
         },
     )
     reports = []
-    for _, compile_encoder, compile_decoder, pipeline in POLICIES:
+    for name, compile_encoder, compile_decoder, pipeline in POLICIES:
         reports.append(
             profile(
                 model,
@@ -293,6 +351,8 @@ def main(argv=None):
                 compile_encoder=compile_encoder,
                 compile_decoder=compile_decoder,
                 pipeline=pipeline,
+                joint_decoding=name in JOINT_CHUNKS,
+                decode_chunk_size=JOINT_CHUNKS.get(name, 1),
                 word_timestamps=args.word_timestamps,
             )
         )

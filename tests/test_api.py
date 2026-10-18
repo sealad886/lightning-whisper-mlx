@@ -68,7 +68,7 @@ def test_transcription_rejects_assistant_with_different_mel_bins(monkeypatch):
     )
     with pytest.raises(ValueError, match="mel bin count"):
         transcribe.transcribe_audio(
-            "unused.wav",
+            mx.array([0.0, 1.0]),
             batch_size=1,
             language="en",
             speculative_mode="assistant",
@@ -108,7 +108,7 @@ def test_transcription_reports_missing_mtp_checkpoint(monkeypatch, checkpoint_op
     )
     with pytest.raises(ValueError, match="requires mtp_checkpoint"):
         transcribe.transcribe_audio(
-            "unused.wav",
+            mx.array([0.0, 1.0]),
             batch_size=1,
             language="en",
             speculative_mode="mtp",

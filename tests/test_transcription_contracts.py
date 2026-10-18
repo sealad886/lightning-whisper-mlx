@@ -57,13 +57,17 @@ def transcription(monkeypatch):
     monkeypatch.setattr(tr.ModelHolder, "get_model", lambda *args: model)
     monkeypatch.setattr(tr, "get_tokenizer", lambda *args, **kwargs: Tokenizer())
 
-    def run(seconds=90, **kwargs):
+    def run(seconds=90, waveform=None, **kwargs):
         mel = mx.array(
             np.arange(round(seconds * 100) + 3000, dtype=np.float32)[:, None]
         )
         monkeypatch.setattr(tr, "log_mel_spectrogram", lambda *args, **kwargs: mel)
+        if waveform is None:
+            waveform = np.resize(
+                np.array([0.0, 1.0], np.float32), round(seconds * 16000)
+            )
         return tr.transcribe_audio(
-            "unused", language=kwargs.pop("language", "en"), fp16=False, **kwargs
+            waveform, language=kwargs.pop("language", "en"), fp16=False, **kwargs
         )
 
     return model, run
@@ -150,11 +154,14 @@ def test_independent_recordings_batch_without_sharing_conditioned_prompts(
         tr,
         "log_mel_spectrogram",
         lambda audio, **kwargs: mx.array(
-            (np.arange(9000, dtype=np.float32) + audio)[:, None]
+            (np.arange(9000, dtype=np.float32) + audio[0].item() * 15000)[:, None]
         ),
     )
     result = tr.transcribe_many_audio(
-        [0, 30000],
+        [
+            np.resize(np.array([0.0, 1.0], np.float32), 960000),
+            np.resize(np.array([2.0, 3.0], np.float32), 960000),
+        ],
         model_instance=model,
         language="en",
         fp16=False,
@@ -308,3 +315,135 @@ def test_short_auto_language_does_not_reuse_differently_padded_features(
     assert len(supplied_features) == 1
     assert supplied_features[0] is None
     assert model.encodings == 1
+
+
+@pytest.mark.parametrize("value", [0.0, 0.25, -0.5])
+@pytest.mark.parametrize("without_timestamps", [False, True])
+def test_constant_audio_cannot_emit_confident_hallucination(
+    transcription, value, without_timestamps
+):
+    model, run = transcription
+    model.answer = lambda *args: {"no_speech_prob": 0.9, "avg_logprob": -0.1}
+    result = run(
+        29,
+        waveform=np.full(29 * 16000, value, np.float32),
+        without_timestamps=without_timestamps,
+        initial_prompt="names",
+    )
+    assert result == {"text": "", "segments": [], "language": "en"}
+    assert model.calls == []
+
+
+def test_constant_window_between_speech_preserves_context_and_absolute_seek(
+    transcription,
+):
+    model, run = transcription
+    waveform = np.resize(np.array([0.0, 1.0], np.float32), 90 * 16000)
+    # Include the STFT context around this middle window in its silent interval.
+    waveform[30 * 16000 - 200 : 60 * 16000 + 200] = 0
+    result = run(90, waveform=waveform, initial_prompt="names", batch_size=3)
+    assert [starts for starts, _ in model.calls] == [[0], [6000]]
+    assert [options.prompt for _, options in model.calls] == [[99], [99, 1]]
+    assert [segment["seek"] for segment in result["segments"]] == [0, 6000]
+    assert result["text"] == "1 3 "
+
+
+@pytest.mark.parametrize("amplitude", [1e-8, 1e-12])
+def test_exact_gate_preserves_arbitrarily_quiet_nonconstant_samples(
+    transcription, amplitude
+):
+    model, run = transcription
+    waveform = np.zeros(16000, np.float32)
+    waveform[8000] = amplitude
+    # Keep the established confidence override for actual varying samples.
+    model.answer = lambda *args: {"no_speech_prob": 0.9, "avg_logprob": -0.1}
+    assert run(1, waveform=waveform)["text"] == "1 "
+    assert len(model.calls) == 1
+
+
+def test_silent_middle_window_is_omitted_from_independent_batch(transcription):
+    model, run = transcription
+    waveform = np.resize(np.array([0.0, 1.0], np.float32), 90 * 16000)
+    waveform[30 * 16000 - 200 : 60 * 16000 + 200] = 0
+    result = run(90, waveform=waveform, batch_size=3, condition_on_previous_text=False)
+    assert [starts for starts, _ in model.calls] == [[0, 6000]]
+    assert [segment["seek"] for segment in result["segments"]] == [0, 6000]
+
+
+def test_clip_gate_keeps_stft_context_and_absolute_offsets(transcription):
+    model, run = transcription
+    waveform = np.zeros(60 * 16000, np.float32)
+    # This sample is before the selected clip, but contributes to its first
+    # centered STFT frame. The gate must conservatively retain that window.
+    waveform[30 * 16000 - 100] = 1e-8
+    result = run(60, waveform=waveform, clip_timestamps=[30, 40])
+    assert [starts for starts, _ in model.calls] == [[3000]]
+    assert result["segments"][0]["start"] == 30
+    assert result["segments"][0]["end"] == 40
+
+
+def test_fully_constant_clip_does_not_transcribe_speech_outside_context(transcription):
+    model, run = transcription
+    waveform = np.zeros(60 * 16000, np.float32)
+    waveform[0] = 1
+    result = run(60, waveform=waveform, clip_timestamps=[30, 40])
+    assert result == {"text": "", "segments": [], "language": "en"}
+    assert model.calls == []
+
+
+def test_auto_language_is_preserved_when_transcription_windows_are_constant(
+    transcription,
+):
+    model, run = transcription
+    model.is_multilingual, model.num_languages = True, 99
+    detections = []
+    model.embed_audio = lambda batch: batch
+    model.detect_language = lambda features: (
+        detections.append(features) or None,
+        {"fr": 1.0},
+    )
+    result = run(29, waveform=np.zeros(29 * 16000, np.float32), language=None)
+    assert result == {"text": "", "segments": [], "language": "fr"}
+    assert len(detections) == 1
+    assert model.calls == []
+
+
+def test_file_waveform_is_decoded_once_before_mel_and_gate(transcription, monkeypatch):
+    from lightning_whisper_mlx import audio
+
+    model, run = transcription
+    calls = []
+    waveform = mx.array([0.0, 1.0] * 8000)
+    monkeypatch.setattr(
+        audio, "load_audio", lambda path: calls.append(path) or waveform
+    )
+    run(1, waveform="recording.wav")
+    assert calls == ["recording.wav"]
+    assert len(model.calls) == 1
+
+
+def test_independent_request_batch_preserves_empty_and_speech_result_order(
+    transcription, monkeypatch
+):
+    model, _ = transcription
+    monkeypatch.setattr(
+        tr,
+        "log_mel_spectrogram",
+        lambda audio, **kwargs: mx.array(
+            (np.arange(3300, dtype=np.float32) + audio[0].item() * 30000)[:, None]
+        ),
+    )
+    outputs = tr.transcribe_many_audio(
+        [
+            np.zeros(48000, np.float32),
+            np.resize(np.array([1.0, 2.0], np.float32), 48000),
+        ],
+        model_instance=model,
+        language="en",
+        fp16=False,
+        batch_size=2,
+        temperature=0.0,
+    )
+    assert outputs[0] == {"text": "", "segments": [], "language": "en"}
+    assert outputs[1]["text"] == "11 "
+    assert [starts for starts, _ in model.calls] == [[30000]]

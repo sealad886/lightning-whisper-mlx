@@ -97,6 +97,8 @@ class LightningWhisperMLX:
                 self._model.configure_execution(
                     compile_encoder=self.compile_encoder,
                     compile_decoder=self.compile_decoder,
+                    joint_decoding=self.compile_decoder,
+                    decode_chunk_size=4,
                 )
             self._identity = identity
         return self._model

@@ -159,3 +159,36 @@ def test_spectral_failure_restores_default_device(monkeypatch):
         assert mx.default_device() == mx.gpu
     finally:
         mx.set_default_device(original)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_resident_session_executes_measured_chunks_when_compilation_enabled(
+    tmp_path, compiled
+):
+    from lightning_whisper_mlx.decoding import DecodingOptions
+    from lightning_whisper_mlx.tokenizer import get_tokenizer
+
+    dims = ModelDimensions(4, 3, 8, 2, 1, 51865, 16, 8, 2, 1)
+    source = Whisper(dims, mx.float32)
+    (tmp_path / "config.json").write_text(json.dumps(asdict(dims)))
+    mx.savez(str(tmp_path / "weights.npz"), **dict(tree_flatten(source.parameters())))
+    engine = lightning.LightningWhisperMLX(
+        tmp_path, dtype=mx.float32, compile_decoder=compiled, local_files_only=True
+    )
+    resident = engine.model
+    tokenizer = get_tokenizer(True, num_languages=99, language="en", task="transcribe")
+    options = DecodingOptions(
+        language="en",
+        fp16=False,
+        sample_len=7,
+        without_timestamps=True,
+        suppress_tokens=[tokenizer.eot],
+    )
+    results = resident.decode(mx.zeros((2, 3, 8)), options)
+    assert all(len(result.tokens) == 7 for result in results)
+    if compiled:
+        # Observe the actual executed graph shape rather than constructor kwargs.
+        assert any(key[1] == 4 for key in resident._joint_decoder_cache)
+    else:
+        assert not resident._joint_decoder_cache
+    assert engine.model is resident

@@ -6,14 +6,16 @@ Whisper transcription for Apple Silicon, with batching, quantized models, and op
 
 The chart records historical results. The native engine now has direct, repeated
 Metal whisper.cpp comparisons: observed warm aggregate speedups were 1.19–1.24×
-on an M3 Pro with base/tiny. These are bounded observations under desktop load,
-not a universal minimum. Speech quality passed the relative reference gate;
-timestamp-free long silence failed in both engines. See the
-[current measurements and limitations](docs/evaluation/native-engine.md).
+on an M3 Pro with base/tiny at checkpoint `cb82e1d`. These are bounded observations
+under desktop load, not a universal minimum. The
+[follow-up](docs/evaluation/silence-decoder-followup.md) fixes exact-silence
+hallucination, adds faster bounded greedy chunks, and requires recorded contention
+checks for new performance qualification. See the
+[original measurements](docs/evaluation/native-engine.md) for their precise scope.
 
 ## Features
 
-- Fused MLX attention, packed projections and compiled cached greedy decoding.
+- Fused MLX attention, packed projections and compiled four-token greedy chunks.
 - Resident model sessions, offline local artifacts and bounded recording batches.
 - Greedy, sampling, beam search and word alignment through the same model graph.
 - Optional distilled/quantized artifacts and experimental verified speculation.
@@ -68,6 +70,9 @@ Hugging Face cache, optionally selected with `cache_dir`; existing local artifac
 are read in place. Encoder and cached decoder compilation are enabled by default.
 The first call includes loading/compilation costs. Set `compile_encoder=False,
 compile_decoder=False` when constructing an engine to select eager execution.
+Compiled greedy sessions combine cached decoding with canonical sampling in
+bounded chunks, preserving context limits and EOT scores. Other decoding modes
+retain their own execution paths.
 The optional `pipeline=True` transcription setting queues one additional step;
 it remains disabled by default because it lost the interleaved policy comparison.
 
@@ -159,6 +164,10 @@ print(text)
   named directories when explicitly selected.
 - `segments` contains dictionaries with `start`/`end` in seconds, text, token IDs,
   and decoder scores. `word_timestamps=True` additionally produces aligned words.
+- Transcription skips windows proven to contain exactly constant finite PCM,
+  including digital silence and DC-only audio, without an amplitude cutoff.
+  Quiet nonconstant speech is retained. This is not general VAD for background
+  noise or music; the mel-only decoding primitive keeps the model's raw behavior.
 - [MTP training](docs/training/mtp-training.md) documents the local-only pipeline.
   Completing the workflow does not establish trained-head quality or speed.
 - The [engine design](docs/design/native-inference-engine.md),

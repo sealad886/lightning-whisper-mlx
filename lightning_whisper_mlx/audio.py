@@ -61,6 +61,43 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
     return mx.array(np.frombuffer(out, np.int16)).flatten().astype(mx.float32) / 32768.0
 
 
+def prepare_audio(audio):
+    """Normalize a mono waveform once without changing its sample values.
+
+    Paths are decoded using the canonical loader. Existing MLX arrays retain
+    their storage and precision; callers can reuse the same PCM for mel and
+    exact acoustic-information checks.
+    """
+    with mx.stream(mx.cpu):
+        if isinstance(audio, (str, os.PathLike)):
+            audio = load_audio(str(audio))
+        elif not isinstance(audio, mx.array):
+            audio = mx.array(audio)
+        if audio.ndim != 1:
+            raise ValueError("audio waveform must be one-dimensional mono samples")
+        if not mx.all(mx.isfinite(audio)).item():
+            raise ValueError("audio waveform must contain only finite samples")
+        return audio
+
+
+def is_constant_audio(audio, start, end):
+    """Prove a window has no acoustic variation, with exact PCM equality.
+
+    Include real neighboring samples used by centered STFT frames. Artificial
+    right padding is excluded: it must not turn a constant recording into an
+    apparent acoustic event. No energy threshold or epsilon is used.
+    """
+    with mx.stream(mx.cpu):
+        start = max(0, start - N_FFT // 2)
+        end = min(audio.shape[0], end + N_FFT // 2)
+        if end <= start:
+            return True
+        samples = audio[start:end]
+        return bool(
+            (mx.all(mx.isfinite(samples)) & mx.all(samples == samples[0])).item()
+        )
+
+
 def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
     """
     Pad or trim the audio array to N_SAMPLES, as expected by the encoder.
@@ -152,10 +189,7 @@ def log_mel_spectrogram(
         An  array that contains the Mel spectrogram
     """
     with mx.stream(mx.cpu):
-        if isinstance(audio, str):
-            audio = load_audio(audio)
-        elif not isinstance(audio, mx.array):
-            audio = mx.array(audio)
+        audio = prepare_audio(audio)
 
         if padding > 0:
             audio = mx.pad(audio, (0, padding))

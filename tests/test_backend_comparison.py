@@ -10,7 +10,11 @@ import pytest
 from benchmarks import compare_backends
 
 
-def test_cli_resident_engines_warmups_refs_and_round_robin(monkeypatch, tmp_path):
+@pytest.mark.parametrize("require_uncontended", [False, True])
+@pytest.mark.parametrize("joint_chunk", [None, 1, 4])
+def test_cli_resident_engines_warmups_refs_and_round_robin(
+    monkeypatch, tmp_path, require_uncontended, joint_chunk
+):
     audio = tmp_path / "input.wav"
     audio.write_bytes(b"fixture")
     references = tmp_path / "refs.json"
@@ -28,11 +32,33 @@ def test_cli_resident_engines_warmups_refs_and_round_robin(monkeypatch, tmp_path
     monkeypatch.setattr(
         compare_backends, "model_suppression_ids", lambda *args: (1, 2, 3)
     )
+
+    class Guard:
+        def __init__(self, policy, required=False):
+            self.required = required
+            self.owned_pids = set()
+
+        def check(self, *args, **kwargs):
+            return {"status": "observed-low-contention"}
+
+        def summary(self):
+            return {
+                "status": "observed-low-contention",
+                "qualified": self.required,
+                "required": self.required,
+                "guarantees_uncontended": False,
+            }
+
+    monkeypatch.setattr(compare_backends, "QuietGuard", Guard)
     calls = []
+    configured = []
 
     class Model:
         def parameters(self):
             return []
+
+        def configure_execution(self, **kwargs):
+            configured.append(kwargs)
 
     model = Model()
 
@@ -98,6 +124,17 @@ def test_cli_resident_engines_warmups_refs_and_round_robin(monkeypatch, tmp_path
     assert (
         compare_backends.main(
             [
+                *(["--require-uncontended"] if require_uncontended else []),
+                *(
+                    [
+                        "--compile-decoder",
+                        "--joint-decoding",
+                        "--decode-chunk-size",
+                        str(joint_chunk),
+                    ]
+                    if joint_chunk
+                    else []
+                ),
                 "--mlx-model",
                 str(tmp_path),
                 "--cpp-model",
@@ -124,11 +161,18 @@ def test_cli_resident_engines_warmups_refs_and_round_robin(monkeypatch, tmp_path
         == 0
     )
     report = json.loads(output.read_text())
-    assert report["assessment"]["speed_claim_qualified"]
+    assert report["assessment"]["speed_claim_qualified"] == require_uncontended
     assert calls.count("mlx-init") == calls.count("cpp-init") == 1
     assert calls.count("upload") == 1
     assert calls.count("mlx") == calls.count("cpp") == 3
     assert calls[-1] == "cpp-close"
+    if joint_chunk:
+        assert configured[0]["joint_decoding"]
+        assert configured[0]["decode_chunk_size"] == joint_chunk
+    options = report["results"][0]["metadata"]["options"]
+    assert options["mlx_joint_decoding"] == bool(joint_chunk)
+    assert options["mlx_decode_chunk_size"] == (joint_chunk or 1)
+    assert options["mlx_constant_pcm_rejection"]
     assert report["config"]["execution_policy"] == "interleaved-rotating-start"
 
 

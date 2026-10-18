@@ -219,6 +219,74 @@ class Inference:
         )
         return logits.astype(mx.float32)
 
+    def sample_next(self, tokens, audio_features, decoder, sum_logprobs, max_steps=1):
+        """Run bounded sequential ordinary steps and sampling in one graph.
+
+        The token history includes exactly one token not yet in the cache. The
+        first prompt evaluation and its SOT probabilities stay on the ordinary
+        path; speculation continues to use the logits/hidden-state interface.
+        """
+        length = decoder._prepare_history(tokens)
+        offset = self.cache_length
+        if length != offset + 1 or self.kv_cache is None:
+            raise ValueError("joint sampling requires one uncached history token")
+        for owner, _ in self.kv_cache:
+            owner.ensure_capacity(offset + 1)
+        # Finish at a capacity boundary before growing. Growing early would make
+        # the first step attend across a different padded width than one-step
+        # execution, potentially changing its floating-point arithmetic.
+        steps = min(
+            max_steps,
+            self.kv_cache[0][0].keys.shape[1] - offset,
+            decoder.max_tokens - length,
+        )
+        sampling_key = decoder._sampling_key
+        key = (sampling_key, steps)
+        cache = self.model._joint_decoder_cache
+        compiled = cache.get(key)
+        if compiled is None:
+            filters = tuple(_filter_from_key(item) for item in sampling_key[2])
+            model_decoder = self.model.decoder
+            eot = decoder.eot
+
+            def step(token, features, state, offset, history, scores, length):
+                for index in range(steps):
+                    logits, state, _ = model_decoder(
+                        token, features, kv_cache=state, offset=offset + index
+                    )
+                    history, completed, scores = _greedy_sampling_step(
+                        logits.astype(mx.float32)[:, -1],
+                        history,
+                        scores,
+                        length + index,
+                        filters,
+                        eot,
+                    )
+                    token = mx.take(history, (length + index).reshape(1), axis=1)
+                return history, state, completed, scores
+
+            compiled = mx.compile(step)
+            if len(cache) >= 16:
+                cache.pop(next(iter(cache)))
+            cache[key] = compiled
+        end = offset + steps
+        history, state, completed, sum_logprobs = compiled(
+            tokens[:, -1:],
+            audio_features,
+            self.cache_state,
+            mx.array(offset),
+            decoder._tokens,
+            sum_logprobs,
+            mx.array(length),
+        )
+        for (owner, _), (buffers, _) in zip(self.kv_cache, state):
+            owner.keys, owner.values = buffers
+            owner.offset = end
+        self.last_hidden = None
+        decoder._tokens = history
+        decoder._length = length + steps
+        return history[:, : length + steps], completed, sum_logprobs
+
     @property
     def cache_length(self) -> int:
         if not self.kv_cache or self.kv_cache[0] is None:
@@ -377,6 +445,7 @@ class GreedyDecoder(TokenDecoder):
         self.eot = eot
         self.max_tokens = max_tokens
         self._compiled_sampler = None
+        self._sampling_key = None
         self.reset()
 
     def reset(self):
@@ -390,11 +459,14 @@ class GreedyDecoder(TokenDecoder):
     def configure_sampling(self, filters):
         if self.temperature != 0:
             raise ValueError("compiled sampling requires temperature=0")
-        self._compiled_sampler = _compiled_greedy_sampler(
-            self.eot, self.max_tokens, tuple(f.cache_key for f in filters)
+        self._sampling_key = (
+            self.eot,
+            self.max_tokens,
+            tuple(f.cache_key for f in filters),
         )
+        self._compiled_sampler = _compiled_greedy_sampler(*self._sampling_key)
 
-    def update(self, tokens, logits, sum_logprobs):
+    def _prepare_history(self, tokens):
         length = tokens.shape[-1]
         if tokens.ndim != 2 or not length or length >= self.max_tokens:
             raise ValueError("token history is empty or exceeds decoder context")
@@ -407,6 +479,10 @@ class GreedyDecoder(TokenDecoder):
             self._tokens = mx.slice_update(self._tokens, tokens, mx.array(0), axes=(1,))
         elif self._tokens.shape[0] != tokens.shape[0]:
             raise ValueError("token batch changed without resetting decoder")
+        return length
+
+    def update(self, tokens, logits, sum_logprobs):
+        length = self._prepare_history(tokens)
         if self._compiled_sampler is not None:
             self._tokens, completed, sum_logprobs = self._compiled_sampler(
                 logits, self._tokens, sum_logprobs, mx.array(length)
@@ -566,18 +642,19 @@ def _compiled_greedy_sampler(eot, capacity, filter_keys):
     filters = tuple(_filter_from_key(key) for key in filter_keys)
 
     def step(logits, buffer, scores, length):
-        for logit_filter in filters:
-            logits = logit_filter.apply(logits, buffer, logical_length=length)
-        last = mx.take(buffer, (length - 1).reshape(1), axis=1).reshape(buffer.shape[0])
-        next_tokens, completed, scores = _greedy_transition(
-            logits, last, scores, 0, eot
-        )
-        buffer = mx.slice_update(
-            buffer, next_tokens[:, None], length.reshape(1), axes=(1,)
-        )
-        return buffer, completed, scores
+        return _greedy_sampling_step(logits, buffer, scores, length, filters, eot)
 
     return mx.compile(step)
+
+
+def _greedy_sampling_step(logits, buffer, scores, length, filters, eot):
+    """Canonical pure transition shared by separate and joint compiled graphs."""
+    for logit_filter in filters:
+        logits = logit_filter.apply(logits, buffer, logical_length=length)
+    last = mx.take(buffer, (length - 1).reshape(1), axis=1).reshape(buffer.shape[0])
+    next_tokens, completed, scores = _greedy_transition(logits, last, scores, 0, eot)
+    buffer = mx.slice_update(buffer, next_tokens[:, None], length.reshape(1), axes=(1,))
+    return buffer, completed, scores
 
 
 class DecodingTask:
@@ -852,34 +929,47 @@ class DecodingTask:
         n_batch = tokens.shape[0]
         sum_logprobs: mx.array = mx.zeros(n_batch)
         no_speech_probs = [np.nan] * n_batch
+        joint = (
+            getattr(self.model, "_joint_decoding", False)
+            and getattr(self.decoder, "uses_compiled_filters", False)
+            and not self.options.pipeline
+        )
 
         try:
             logits = self.inference.logits(tokens, audio_features)
-            for i in range(self.sample_len):
-
-                if (
-                    i == 0 and self.tokenizer.no_speech is not None
-                ):  # save no_speech_probs
-                    probs_at_sot = mx.softmax(
-                        logits[:, self.sot_index].astype(mx.float32), axis=-1
+            i = 0
+            while i < self.sample_len:
+                previous_length = tokens.shape[-1]
+                if i and joint:
+                    tokens, completed, sum_logprobs = self.inference.sample_next(
+                        tokens,
+                        audio_features,
+                        self.decoder,
+                        sum_logprobs,
+                        max_steps=min(
+                            self.model._decode_chunk_size,
+                            self.sample_len - i,
+                            self.n_ctx + 1 - previous_length,
+                        ),
                     )
-                    no_speech_probs = probs_at_sot[:, self.tokenizer.no_speech].tolist()
+                else:
+                    if i == 0 and self.tokenizer.no_speech is not None:
+                        probs_at_sot = mx.softmax(
+                            logits[:, self.sot_index].astype(mx.float32), axis=-1
+                        )
+                        no_speech_probs = probs_at_sot[
+                            :, self.tokenizer.no_speech
+                        ].tolist()
+                    logits = logits[:, -1]
+                    if not getattr(self.decoder, "uses_compiled_filters", False):
+                        for logit_filter in self.logit_filters:
+                            logits = logit_filter.apply(logits, tokens)
+                    tokens, completed, sum_logprobs = self.decoder.update(
+                        tokens, logits, sum_logprobs
+                    )
 
-                # now we need to consider the logits at the last token only
-                logits = logits[:, -1]
-
-                # A compiled greedy sampler applies these same canonical filters
-                # inside its fixed-shape token update graph.
-                if not getattr(self.decoder, "uses_compiled_filters", False):
-                    for logit_filter in self.logit_filters:
-                        logits = logit_filter.apply(logits, tokens)
-
-                # expand the tokens tensor with the selected next tokens
-                tokens, completed, sum_logprobs = self.decoder.update(
-                    tokens, logits, sum_logprobs
-                )
-
-                has_next = i + 1 < self.sample_len and tokens.shape[-1] <= self.n_ctx
+                i += tokens.shape[-1] - previous_length
+                has_next = i < self.sample_len and tokens.shape[-1] <= self.n_ctx
                 next_logits = None
                 if has_next and self.options.pipeline:
                     # Schedule bounded work while Python observes the previous
@@ -888,11 +978,14 @@ class DecodingTask:
                     mx.async_eval(next_logits, sum_logprobs, tokens)
                 if completed or not has_next:
                     break
-                logits = (
-                    self.inference.logits(tokens, audio_features)
-                    if next_logits is None
-                    else next_logits
-                )
+                if joint:
+                    logits = None
+                else:
+                    logits = (
+                        self.inference.logits(tokens, audio_features)
+                        if next_logits is None
+                        else next_logits
+                    )
         finally:
             self.inference.reset()
 

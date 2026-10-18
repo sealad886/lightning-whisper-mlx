@@ -5,6 +5,11 @@ Date: 2026-10-18. Implementation baseline: `b670a2e`. See the
 [plan](../plans/native-inference-engine.md) and
 [architecture decision](../adr/native-inference-engine.md).
 
+This page records checkpoint `cb82e1d`. The
+[subsequent silence/decoder follow-up](silence-decoder-followup.md) fixes exact
+constant-PCM hallucination, adds bounded joint generation and introduces explicit
+contention gates. Its measurements and acceptance state are separate.
+
 ## Result and qualification
 
 The integrated implementation replaces the ordinary inference hot path with
