@@ -102,6 +102,53 @@ def test_all_clips_honor_nonzero_starts_and_exclusive_ends(transcription):
     assert [(s["start"], s["end"]) for s in result["segments"]] == [(30, 45), (60, 75)]
 
 
+@pytest.mark.parametrize(
+    "tokens, expected_text, expected_intervals",
+    [
+        ([10000, 1, 11500], "1 ", [(30, 40)]),
+        ([10000, 1, 11200, 11200, 2, 11500], "1 ", [(30, 40)]),
+        ([10000, 1, 10200], "1 ", [(30, 34)]),
+    ],
+)
+def test_timestamp_tokens_cannot_extend_selected_clip(
+    transcription, tokens, expected_text, expected_intervals
+):
+    model, run = transcription
+    model.answer = lambda *args: {"tokens": tokens}
+    result = run(45, clip_timestamps=[30, 40])
+    assert result["text"] == expected_text
+    assert [(s["start"], s["end"]) for s in result["segments"]] == expected_intervals
+    assert len(model.calls) == 1
+
+
+def test_word_alignment_is_bounded_before_updating_later_clip_state(
+    transcription, monkeypatch
+):
+    model, run = transcription
+    model.answer = lambda *args: {"tokens": [10000, 1, 11500]}
+    alignment_state = []
+
+    def align(*, segments, last_speech_timestamp, **kwargs):
+        alignment_state.append(last_speech_timestamp)
+        segment = segments[0]
+        start = segment["seek"] / 100
+        # Alignment/segment heuristics can shift both sides of the window.
+        segment.update(start=start - 1, end=start + 12)
+        segment["words"] = [
+            {"word": "hello", "start": start - 1, "end": start + 12, "probability": 0.9}
+        ]
+
+    monkeypatch.setattr(tr, "add_word_timestamps", align)
+    result = run(75, clip_timestamps=[30, 40, 60, 70], word_timestamps=True)
+    assert alignment_state == [0.0, 40.0]
+    assert [(s["start"], s["end"]) for s in result["segments"]] == [(30, 40), (60, 70)]
+    assert [(w["start"], w["end"]) for s in result["segments"] for w in s["words"]] == [
+        (30, 40),
+        (60, 70),
+    ]
+    assert result["text"] == "1 1 "
+
+
 def test_conditioned_windows_use_committed_previous_text(transcription):
     model, run = transcription
     run(65, batch_size=12, initial_prompt="names")

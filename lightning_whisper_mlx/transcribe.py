@@ -1,6 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 import sys
+import threading
 import warnings
 from typing import List, Optional, Tuple, Union
 
@@ -54,15 +55,19 @@ class ModelHolder:
     model = None
     model_path = None
     model_identity = None
+    _lock = threading.RLock()
 
     @classmethod
     def get_model(cls, model_path: str, dtype: mx.Dtype):
-        identity = (model_artifact_identity(model_path), str(dtype))
-        if cls.model is None or identity != cls.model_identity:
-            cls.model = load_model(model_path, dtype=dtype)
-            cls.model_path = model_path
-            cls.model_identity = (model_artifact_identity(model_path), str(dtype))
-        return cls.model
+        with cls._lock:
+            identity = (model_artifact_identity(model_path), str(dtype))
+            if cls.model is None or identity != cls.model_identity:
+                model = load_model(model_path, dtype=dtype)
+                identity = (model_artifact_identity(model_path), str(dtype))
+                cls.model = model
+                cls.model_path = model_path
+                cls.model_identity = identity
+            return cls.model
 
 
 @dataclass
@@ -509,6 +514,24 @@ def _transcribe_audio(
         window_end_time = time_offset + segment_duration
         current_segments = []
 
+        def bound_segments(segments):
+            bounded = []
+            for segment in segments:
+                start = max(time_offset, segment["start"])
+                end = min(window_end_time, segment["end"])
+                if start >= end:
+                    continue
+                segment["start"], segment["end"] = start, end
+                # Preserve aligned text/tokens, including words that collapse
+                # onto a clip edge, while bounding all reported metadata.
+                for word in segment.get("words", ()):
+                    word["start"] = max(
+                        time_offset, min(window_end_time, word["start"])
+                    )
+                    word["end"] = max(word["start"], min(window_end_time, word["end"]))
+                bounded.append(segment)
+            return bounded
+
         if no_speech_threshold is not None:
             should_skip = res.no_speech_prob > no_speech_threshold
             if logprob_threshold is not None and res.avg_logprob > logprob_threshold:
@@ -602,6 +625,7 @@ def _transcribe_audio(
             )
             seek += segment_size
 
+        current_segments = bound_segments(current_segments)
         if word_timestamps:
             add_word_timestamps(
                 segments=current_segments,
@@ -614,6 +638,7 @@ def _transcribe_audio(
                 last_speech_timestamp=last_speech_timestamp,
                 audio_features=res.audio_features,
             )
+            current_segments = bound_segments(current_segments)
 
             if not single_timestamp_ending:
                 last_word_end = _get_end(current_segments)
