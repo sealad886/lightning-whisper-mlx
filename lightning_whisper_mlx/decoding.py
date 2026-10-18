@@ -735,6 +735,14 @@ class DecodingTask:
             self.decoder.configure_sampling(self.logit_filters)
 
     def _verify_options(self, options: DecodingOptions) -> DecodingOptions:
+        if not np.isfinite(options.temperature) or options.temperature < 0:
+            raise ValueError("temperature must be finite and non-negative")
+        if options.sample_len is not None and (
+            not isinstance(options.sample_len, int)
+            or isinstance(options.sample_len, bool)
+            or options.sample_len < 1
+        ):
+            raise ValueError("sample_len must be a positive integer")
         if options.beam_size is not None and options.temperature != 0:
             raise ValueError("beam search requires temperature=0")
         if options.best_of is not None and (
@@ -768,7 +776,17 @@ class DecodingTask:
         return options
 
     def _get_initial_tokens(self) -> Tuple[int]:
+        """Fit context while retaining recent prefix before historical prompt.
+
+        Leave at least one text-context position for generation. Historical
+        prompt retains its half-context cap and yields space to the current
+        prefix when their composition overflows. ``sample_len`` remains a
+        generation upper limit, independent of available context capacity.
+        """
         tokens = list(self.sot_sequence)
+        prefix_budget = self.n_ctx - len(tokens) - 1
+        if prefix_budget < 0:
+            raise ValueError("text context must leave room for token generation")
 
         if prefix := self.options.prefix:
             prefix_tokens = (
@@ -776,9 +794,7 @@ class DecodingTask:
                 if isinstance(prefix, str)
                 else prefix
             )
-            if self.sample_len is not None:
-                max_prefix_len = self.n_ctx // 2 - self.sample_len
-                prefix_tokens = prefix_tokens[-max_prefix_len:]
+            prefix_tokens = prefix_tokens[max(0, len(prefix_tokens) - prefix_budget) :]
             tokens = tokens + prefix_tokens
 
         if prompt := self.options.prompt:
@@ -787,11 +803,16 @@ class DecodingTask:
                 if isinstance(prompt, str)
                 else prompt
             )
-            tokens = (
-                [self.tokenizer.sot_prev]
-                + prompt_tokens[-(self.n_ctx // 2 - 1) :]
-                + tokens
+            prompt_budget = min(
+                self.n_ctx // 2 - 1,
+                self.n_ctx - len(tokens) - 2,  # prompt separator and generation
             )
+            if prompt_budget > 0:
+                tokens = (
+                    [self.tokenizer.sot_prev]
+                    + prompt_tokens[max(0, len(prompt_tokens) - prompt_budget) :]
+                    + tokens
+                )
 
         return tuple(tokens)
 
